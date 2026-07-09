@@ -1,0 +1,82 @@
+# --- Byte-compiled / cache files ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# --- Distribution / packaging ---
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg
+MANIFEST
+
+# --- Environment / secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.json
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# --- Testing / coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+
+# --- Type checkers / linters ---
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+.ruff_cache/
+
+# --- Jupyter / IPython ---
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS-generated files ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+
+# --- Logs / local runtime data ---
+*.log
+logs/
+*.sqlite3
+*.db
+
+# --- Project-specific local scratch (adjust as needed) ---
+/scratch/
+/tmp/
