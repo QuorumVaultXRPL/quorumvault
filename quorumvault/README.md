@@ -101,6 +101,16 @@ resolves to "compliant," but a caller catching only `ComplianceReadError`
 would see an uncaught exception instead. Wrapping that parse step in
 `ComplianceReadError` would make the typed guarantee airtight; not yet done.
 
+**Proven live on Testnet (2026-07-10).** Beyond the fake-client tests,
+`XrplLedgerComplianceReader` was wired into `QuorumVaultExternalSigner` and run
+against a real MPT issuance (RequireAuth + CanTransfer) through the full Agent
+Wallet Skill ceremony: a compliant transfer to an issuer-authorized holder was
+delivered on-ledger (tx `6AC230DCEC1B140F7B6CAEC9311FD6E1C1F7DCFDC9F30055615019762A9DC0DB`,
+a validated 2-of-2 multisig), and a transfer to an opted-in-but-never-authorized
+holder was refused by the signer — driven by the live `destination_authorized=
+False` read, the fail-closed guarantee holding against a real server, not a mock.
+See `mpt_rwa_demo.py`.
+
 ## Security tradeoffs (flagged, not hidden)
 
 1. **ed25519 keys vs. cloud HSM/KMS.** The current Testnet signers are ed25519.
@@ -166,78 +176,14 @@ python testnet_multisig_demo_v2.py --submit
   secp256k1 key and a `SignerListSet` update on the treasury.
 - Human-override path is still the v1 model; production wants SSO + hardware MFA
   (FIDO2/WebAuthn) bound to the tx hash.
-- `XrplLedgerComplianceReader` (live RWA reads) is written and tested against a
-  fake client (`tests/test_ledger_reader.py`), but not yet run against a real
-  server — no MPT issuance has actually been created on Testnet to point it at.
-  That live run, plus wiring it into `testnet_multisig_demo_v2.py`'s dry-run
-  path, is the next step.
+- `XrplLedgerComplianceReader` (live RWA reads) — **done**: run against a real
+  Testnet MPT issuance through the full ceremony, both the compliant path
+  (delivered on-ledger) and the fail-closed refusal of an unauthorized holder
+  (see the RWA section above and `mpt_rwa_demo.py`).
 - No independent security audit. Required before any of this touches real funds.
 
 ## Post-review refinements (2026-07-10)
 
 **Value conversion is injectable, not a constant.** The XRP->RLUSD rate that
 every value-based decision depends on (tier routing, fast-path ceiling, the risk
-engine's value threshold) is a `RateProvider`, not a hardcoded number. A stale
-rate would otherwise silently misroute a transaction into a less-audited tier, or
-let an over-threshold transfer skip the value gate. `StaticRateProvider` is a
-labelled Testnet placeholder (`is_live == False`); for real funds inject a
-`CallableRateProvider` wrapping a live feed, with `max_age_s` set so a stale
-price raises `StaleRateError` instead of being routed on.
-
-**Keystore nuance (4th tradeoff).** The backend no longer retains the passphrase
-for its lifetime. On the production path (no explicit passphrase) it resolves
-`QUORUMVAULT_KEYSTORE_PASSPHRASE` fresh on each `sign()` and stores no secret; an
-explicit provider callable (e.g. an OS-keyring lookup) is invoked per signature.
-The env var itself remains the secret's home, so protect the process environment.
-
-**Backend decision (recorded).** Local encrypted keystore only for now — it's
-ed25519-native (zero migration) and already removes the actual problem (the
-plaintext seed file). Do **not** migrate to AWS KMS before the security audit
-that gates real funds: solving HSM custody early means a real operational step
-(new secp256k1 key + `SignerListSet` update) to protect funds that aren't there
-yet. Revisit KMS vs. Vault at the audit, leaning Vault if forced to choose today
-(native ed25519, no forced key-scheme migration); reach for AWS KMS first only if
-standardizing on AWS for other reasons.
-
-## Integration: XRPL Agent Wallet Skill (ExternalSigner) — proven on Testnet
-
-Ripple's [XRPL Agent Wallet Skill](https://xrpl.org/docs/agents/xrpl-agent-wallet-skill)
-is the wallet/signing layer for Claude agents on XRPL. It deliberately excludes
-multisig:
-
-> "Multisig. Not in scope. If you're handed a multisig transaction (one
-> expecting a Signers array), refuse and tell the human that multisig signing is
-> not handled by this skill — the developer needs a dedicated multisig flow."
-
-QuorumVault is that dedicated flow. `quorumvault/integrations/external_signer.py`
-implements the skill's own production signing contract —
-`ExternalSigner { address; sign(tx) -> {tx_blob, hash} }` — with the `sign` step
-backed by QuorumVault's risk-gated 2-of-2 multisig (Auditor gate + TierRouter +
-QuorumSigner). `agent_wallet_ceremony.py` runs the skill's documented six-step
-ceremony (autofill → exact preview block → confirm → sign → persist-hash →
-submitAndWait); `agent_wallet_skill_demo.py` runs it end to end on Testnet.
-
-**Proven on Testnet:** the ceremony produced a *validated 2-of-2 multisig Payment*
-(empty `SigningPubKey`, two `Signers`), with `SourceTag 20260530` applied per the
-skill — tx `B52360E50C4C1B2F0A7AEBD4168C71574B163089C6E151EA6263DD7EFE49582B`
-(https://testnet.xrpl.org/transactions/B52360E50C4C1B2F0A7AEBD4168C71574B163089C6E151EA6263DD7EFE49582B).
-
-**Decision (a vs b):** the ceremony is realized in Python (option **b**), because
-QuorumVault is Python and this proves the contract end-to-end to a real hash with
-no TS↔Python bridge. The signer object is exactly the `ExternalSigner` shape, so a
-thin xrpl.js shim RPC-ing into it (option **a** — sitting behind a live Claude
-agent running the skill) is transport, not proof, and is the documented
-production path.
-
-**Hardened after an adversarial review.** The signer default-denies by
-transaction type — it only ever risk-gates `Payment`; everything else
-(`SignerListSet`, `AccountSet`, `SetRegularKey`, …) is refused outright, before
-the risk score even runs, because those transactions carry no "amount" for a
-value check to mean anything. IOU/MPT amounts are parsed from the transaction's
-canonical XRPL form so they're valued correctly rather than defaulting to zero.
-An MPT (RWA) transfer is refused unless a `LedgerComplianceReader` is explicitly
-wired in — the RWA rule runs against a real resolved `RwaTransfer` or the
-signer doesn't sign, never the rule silently skipped. See
-`tests/test_external_signer_adversarial.py` for the regression tests, including
-one that whitelists the treasury address specifically to prove the type refusal
-doesn't secretly depend on that *not* being the case.
+engine's value threshold) is a `RateProvider
