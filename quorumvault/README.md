@@ -28,6 +28,9 @@ quorumvault/
     channel_custody.py Payment-Channel lane (audited at open/close only)
     fast_path.py       Velocity-Bounded Fast Path (LastLedgerSequence expiry)
     router.py          TierRouter (picks the lane by value; RWA always -> quorum)
+  integrations/
+    external_signer.py    QuorumVaultExternalSigner — the XRPL Agent Wallet Skill's ExternalSigner contract
+    agent_wallet_ceremony.py  faithful simulation of the skill's six-step signing ceremony
   tools/
     migrate_keystore.py  import plaintext checkpoint -> encrypted keystore, then shred
 ```
@@ -89,6 +92,15 @@ Scope: MPT-based RWAs only; IOU clawback exposure is the other half of
 `RwaTransfer.token_kind` and remains unimplemented until something in
 QuorumVault actually moves IOUs.
 
+Two defense-in-depth notes from an adversarial review (flagged, not fail-open):
+a malformed-but-"successful" server response blocks via safe defaults
+(`Flags` missing → `transfer_disabled=True`) rather than an explicit raise; and
+a malformed on-ledger integer/field value raises `ValueError`/`KeyError`
+rather than the typed `ComplianceReadError` — it still blocks and never
+resolves to "compliant," but a caller catching only `ComplianceReadError`
+would see an uncaught exception instead. Wrapping that parse step in
+`ComplianceReadError` would make the typed guarantee airtight; not yet done.
+
 ## Security tradeoffs (flagged, not hidden)
 
 1. **ed25519 keys vs. cloud HSM/KMS.** The current Testnet signers are ed25519.
@@ -140,7 +152,7 @@ pip install "xrpl-py>=5" cryptography           # boto3 only if you use the KMS 
 export QUORUMVAULT_KEYSTORE_PASSPHRASE='…'
 
 python testnet_multisig_demo_v2.py              # offline dry run: routing + 2-of-2 multisign
-python -m pytest tests/ -q                      # 76 tests, all offline
+python -m pytest tests/ -q                      # 101 tests, all offline
 
 # Opt-in live Testnet broadcast (Testnet only, double-gated):
 export QUORUMVAULT_CONFIRM_TESTNET=yes
@@ -186,3 +198,46 @@ that gates real funds: solving HSM custody early means a real operational step
 yet. Revisit KMS vs. Vault at the audit, leaning Vault if forced to choose today
 (native ed25519, no forced key-scheme migration); reach for AWS KMS first only if
 standardizing on AWS for other reasons.
+
+## Integration: XRPL Agent Wallet Skill (ExternalSigner) — proven on Testnet
+
+Ripple's [XRPL Agent Wallet Skill](https://xrpl.org/docs/agents/xrpl-agent-wallet-skill)
+is the wallet/signing layer for Claude agents on XRPL. It deliberately excludes
+multisig:
+
+> "Multisig. Not in scope. If you're handed a multisig transaction (one
+> expecting a Signers array), refuse and tell the human that multisig signing is
+> not handled by this skill — the developer needs a dedicated multisig flow."
+
+QuorumVault is that dedicated flow. `quorumvault/integrations/external_signer.py`
+implements the skill's own production signing contract —
+`ExternalSigner { address; sign(tx) -> {tx_blob, hash} }` — with the `sign` step
+backed by QuorumVault's risk-gated 2-of-2 multisig (Auditor gate + TierRouter +
+QuorumSigner). `agent_wallet_ceremony.py` runs the skill's documented six-step
+ceremony (autofill → exact preview block → confirm → sign → persist-hash →
+submitAndWait); `agent_wallet_skill_demo.py` runs it end to end on Testnet.
+
+**Proven on Testnet:** the ceremony produced a *validated 2-of-2 multisig Payment*
+(empty `SigningPubKey`, two `Signers`), with `SourceTag 20260530` applied per the
+skill — tx `B52360E50C4C1B2F0A7AEBD4168C71574B163089C6E151EA6263DD7EFE49582B`
+(https://testnet.xrpl.org/transactions/B52360E50C4C1B2F0A7AEBD4168C71574B163089C6E151EA6263DD7EFE49582B).
+
+**Decision (a vs b):** the ceremony is realized in Python (option **b**), because
+QuorumVault is Python and this proves the contract end-to-end to a real hash with
+no TS↔Python bridge. The signer object is exactly the `ExternalSigner` shape, so a
+thin xrpl.js shim RPC-ing into it (option **a** — sitting behind a live Claude
+agent running the skill) is transport, not proof, and is the documented
+production path.
+
+**Hardened after an adversarial review.** The signer default-denies by
+transaction type — it only ever risk-gates `Payment`; everything else
+(`SignerListSet`, `AccountSet`, `SetRegularKey`, …) is refused outright, before
+the risk score even runs, because those transactions carry no "amount" for a
+value check to mean anything. IOU/MPT amounts are parsed from the transaction's
+canonical XRPL form so they're valued correctly rather than defaulting to zero.
+An MPT (RWA) transfer is refused unless a `LedgerComplianceReader` is explicitly
+wired in — the RWA rule runs against a real resolved `RwaTransfer` or the
+signer doesn't sign, never the rule silently skipped. See
+`tests/test_external_signer_adversarial.py` for the regression tests, including
+one that whitelists the treasury address specifically to prove the type refusal
+doesn't secretly depend on that *not* being the case.
