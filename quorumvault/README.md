@@ -23,6 +23,7 @@ quorumvault/
   policy/      the risk rules
     risk_engine.py     v1's three rules (value/whitelist/velocity) + circuit breaker
     rwa_rule.py        the 4th rule: RWA compliance (MPT/Credentials/Domains/Clawback)
+    ledger_reader.py   LedgerComplianceReader — resolves that rule's input from live XRPL state
   tiers/       the v2 assurance lanes
     channel_custody.py Payment-Channel lane (audited at open/close only)
     fast_path.py       Velocity-Bounded Fast Path (LastLedgerSequence expiry)
@@ -49,6 +50,44 @@ is **byte-for-byte identical** to xrpl-py's own `sign(multisign=True)` +
 changes is *where the signature comes from*. `tests/test_mixed_backend_quorum.py`
 proves a single quorum can mix an ed25519 local-keystore signer with a
 secp256k1 KMS signer, with the quorum logic above unchanged.
+
+## RWA compliance: live ledger reads
+
+`rwa_rule.py`'s `RwaComplianceRule.evaluate()` stays a pure function over an
+already-resolved `RwaTransfer` — no network calls, so it stays fast and fully
+testable offline. `ledger_reader.py` is what actually produces that
+`RwaTransfer` from real chain state, as the same kind of injectable seam as
+`SignerBackend` and `RateProvider`:
+
+```python
+class LedgerComplianceReader(ABC):
+    def resolve(self, *, mpt_issuance_id, destination,
+                required_credentials=None, domain_id=None) -> RwaTransfer: ...
+```
+
+`XrplLedgerComplianceReader` implements it against any xrpl-py sync `Client`
+(so Testnet vs. Mainnet is the caller's choice, never hardcoded): it reads the
+`MPTokenIssuance`'s flags (`lsfMPTRequireAuth`, `lsfMPTCanTransfer`,
+`lsfMPTCanClawback`), the destination's `MPToken` (`lsfMPTAuthorized`), and —
+if a Permissioned Domain applies — its `AcceptedCredentials`, checking the
+destination's actual `Credential` objects (accepted + unexpired). Domain
+membership is OR semantics (holding *any one* accepted credential is
+sufficient), matching XRPL's own rule; explicit policy-required credentials
+are AND semantics (every one must be held), matching `rwa_rule.py`'s existing
+check. `StaticComplianceReader` is a labelled placeholder for dry runs,
+mirroring `StaticRateProvider`.
+
+**Fails closed.** A network/transport error, or any server response that
+isn't a clean success or a well-formed "object not found," raises
+`ComplianceReadError` rather than defaulting to "compliant." A confirmed
+"doesn't exist" (no `MPToken` for this holder, no matching `Credential`) is a
+real negative answer, not a read failure. Field/flag names were verified
+against xrpl.org's current ledger-format reference and the `xrpl-py` 5.0.0
+request models, not reconstructed from memory — see `tests/test_ledger_reader.py`
+(20 tests against a fake client) for the exact ledger JSON shapes exercised.
+Scope: MPT-based RWAs only; IOU clawback exposure is the other half of
+`RwaTransfer.token_kind` and remains unimplemented until something in
+QuorumVault actually moves IOUs.
 
 ## Security tradeoffs (flagged, not hidden)
 
@@ -101,7 +140,7 @@ pip install "xrpl-py>=5" cryptography           # boto3 only if you use the KMS 
 export QUORUMVAULT_KEYSTORE_PASSPHRASE='…'
 
 python testnet_multisig_demo_v2.py              # offline dry run: routing + 2-of-2 multisign
-python -m pytest tests/ -q                      # 50 tests, all offline
+python -m pytest tests/ -q                      # 76 tests, all offline
 
 # Opt-in live Testnet broadcast (Testnet only, double-gated):
 export QUORUMVAULT_CONFIRM_TESTNET=yes
@@ -115,8 +154,11 @@ python testnet_multisig_demo_v2.py --submit
   secp256k1 key and a `SignerListSet` update on the treasury.
 - Human-override path is still the v1 model; production wants SSO + hardware MFA
   (FIDO2/WebAuthn) bound to the tx hash.
-- The RWA rule reasons over a supplied compliance context; wiring it to live
-  ledger reads (MPT issuance flags, credential/domain objects) is the next step.
+- `XrplLedgerComplianceReader` (live RWA reads) is written and tested against a
+  fake client (`tests/test_ledger_reader.py`), but not yet run against a real
+  server — no MPT issuance has actually been created on Testnet to point it at.
+  That live run, plus wiring it into `testnet_multisig_demo_v2.py`'s dry-run
+  path, is the next step.
 - No independent security audit. Required before any of this touches real funds.
 
 ## Post-review refinements (2026-07-10)
