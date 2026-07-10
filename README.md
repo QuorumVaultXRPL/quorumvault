@@ -107,7 +107,7 @@ quorumvault/
 └── tools/
     └── migrate_keystore.py  import a plaintext checkpoint → encrypted keystore, then shred
 
-tests/                          56 tests, fully offline, no network calls
+tests/                          76 tests, fully offline, no network calls
 testnet_multisig_demo.py        v1 — the original real Testnet proof (hashes above)
 testnet_multisig_demo_v2.py     v2 — refactored onto the signing abstraction + tiers
 xrpl_auditor_production_blueprint.py   the original design prototype (see below)
@@ -154,7 +154,7 @@ git clone https://github.com/QuorumVaultXRPL/quorumvault.git
 cd quorumvault
 pip install -r requirements.txt        # boto3 only needed for the AWS KMS backend
 
-# Full offline test suite — 56 tests, no network calls
+# Full offline test suite — 76 tests, no network calls
 python -m pytest tests/ -q
 
 # Offline dry run: tiered routing + a real 2-of-2 multisign, no broadcast
@@ -191,7 +191,7 @@ python testnet_multisig_demo_v2.py --submit
 - [x] Tiered routing: Channel-Custody lane, Velocity-Bounded Fast Path, 2-of-2 quorum backstop
 - [x] RWA compliance rule (MPTs, Credentials, Permissioned Domains, Clawback)
 - [ ] Live AWS KMS run against a real secp256k1 signer (current KMS backend is tested against a mock)
-- [ ] RWA rule wired to live ledger reads (currently reasons over a supplied compliance context)
+- [x] RWA rule wired to live ledger reads (XrplLedgerComplianceReader is written and tested against a fake client; not yet run against a real server)
 - [ ] SSO + hardware MFA (FIDO2/WebAuthn) for human overrides, replacing the current bare-token model
 - [ ] Independent security audit — required before any of this touches Mainnet or real funds
 
