@@ -1,25 +1,29 @@
 # QuorumVault
 
-### An XRPL AI Risk Auditor & Circuit Breaker
+### Self-Custody 2-of-2 Multisig Risk Auditor & Circuit Breaker for AI Treasury Agents on the XRP Ledger
 
-![Status](https://img.shields.io/badge/status-prototype-yellow) ![Python](https://img.shields.io/badge/python-3.9%2B-blue) ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+![Status](https://img.shields.io/badge/status-testnet--proven-blue) ![Security Audit](https://img.shields.io/badge/security%20audit-pending-orange) ![Python](https://img.shields.io/badge/python-3.9%2B-blue) ![License](https://img.shields.io/badge/license-BSL%201.1-lightgrey)
 
 **A self-custody risk and control layer for AI execution agents operating on the XRP Ledger.**
 
-Autonomous trading and treasury agents are increasingly authorized to move real capital — XRP, RLUSD, and other assets — without a human in the loop on every transaction. QuorumVault is a reference architecture and working simulation for the control layer that has to exist *before* that's safe: an independent Auditor Agent that reviews every proposed transaction against corporate risk policy, and a 2-of-2 multi-signature custody model that makes it structurally impossible for a single compromised or malfunctioning agent to move funds unilaterally — without handing custody to any third party, including us.
+Autonomous trading and treasury agents are increasingly authorized to move real capital — XRP, RLUSD, and other assets — without a human in the loop on every transaction. QuorumVault is the control layer that has to exist before that's safe: an independent Auditor Agent that reviews every proposed transaction against risk policy, and a 2-of-2 multisig custody model — enforced on-ledger by the XRPL itself — that makes it structurally impossible for a single compromised or malfunctioning agent to move funds unilaterally. No third party ever holds custody, including us.
 
-> **This is a prototype and logic simulation, not production software.** It has no connection to real XRPL accounts, real cryptographic custody, or real funds. See [Production Roadmap](#production-roadmap) and the Safety Notice below before you take any of this further.
+> **Current status:** the 2-of-2 quorum, the signing abstraction, and the tiered routing described below are implemented and proven against XRPL Testnet with real transactions (hashes below), not simulated ones. Nothing here has touched Mainnet or real funds, and none of it has been through an independent security audit yet. See [Roadmap](#roadmap).
 
 ---
 
 ## Table of contents
 
-- [Project overview](#quorumvault)
 - [Why QuorumVault](#why-quorumvault)
+- [Real Testnet proof](#real-testnet-proof)
 - [System architecture](#system-architecture)
-- [How to run the simulation](#how-to-run-the-simulation)
-- [What to look for in the output](#what-to-look-for-in-the-output)
-- [Production roadmap](#production-roadmap)
+- [Repository layout](#repository-layout)
+- [The signing abstraction](#the-signing-abstraction)
+- [v2 tiered assurance model](#v2-tiered-assurance-model)
+- [Quickstart](#quickstart)
+- [Security tradeoffs](#security-tradeoffs-flagged-not-hidden)
+- [Roadmap](#roadmap)
+- [Original design prototype](#original-design-prototype)
 - [Safety notice](#safety-notice)
 - [License](#license)
 
@@ -27,11 +31,25 @@ Autonomous trading and treasury agents are increasingly authorized to move real 
 
 ## Why QuorumVault
 
-Most existing "safety" tools for AI agent payments — including well-established ones live on XRPL today — work by scoring a transaction's risk and then forwarding it through a single point of custody if the score is low enough. That's a real and useful pattern, but it has a ceiling: it's a probabilistic judgment, not a structural guarantee. A sufficiently well-crafted attack, or a sufficiently confident-sounding hallucination, can still score as "low risk."
+Most existing "safety" tools for AI agent payments — including well-established ones live on XRPL today — work by scoring a transaction's risk and forwarding it through a single point of custody if the score is low enough. That's a real and useful pattern, but it has a ceiling: it's a probabilistic judgment, not a structural guarantee. A sufficiently well-crafted attack, or a sufficiently confident-sounding hallucination, can still score as "low risk."
 
 QuorumVault takes a different, complementary approach for a different situation: **infrequent, high-value corporate treasury transactions**, where the cost of a single bad outcome is severe enough to justify requiring two cryptographically independent parties to agree — not one risk model. No single compromised component, including the Auditor Agent itself, can move funds alone. And unlike custody-as-a-service models, the institution never hands wallet control to a third party at all.
 
 This isn't a claim that QuorumVault is "better" than transaction-scoring infrastructure in general — high-frequency micropayments (paying per API call, machine-to-machine commerce) are a genuinely different problem with different constraints, and probabilistic scoring is the right tool there. QuorumVault is aimed squarely at the treasury custody problem instead.
+
+---
+
+## Real Testnet proof
+
+Not a simulation — these are live, verifiable XRPL Testnet transactions:
+
+| Step | Transaction | Hash |
+|---|---|---|
+| 1. Establish the 2-of-2 quorum | `SignerListSet` | `E22459B72B3F8E5D66BAAC47C00174703F6D15E4167F8AEACBE6B0E80CB4A88B` |
+| 2. Disable the treasury master key | `AccountSet` (`asfDisableMasterKey`) | `2111BBA70A88950E0CE41DFF5D1681C9219BEA55288C90966BC0223DD7C1CC73` |
+| 3. Multisigned payment | `Payment` — neither signer could move funds alone | `A71FEBAC99F8C8A04920731B844678207E94036A8A037A6F531405DBC55FC198` |
+
+View the payment on the [XRPL Testnet Explorer](https://testnet.xrpl.org/transactions/A71FEBAC99F8C8A04920731B844678207E94036A8A037A6F531405DBC55FC198).
 
 ---
 
@@ -41,94 +59,161 @@ The core design principle: **the entity that decides whether a transaction is sa
 
 ```mermaid
 graph TD
-    EA["Execution Agent<br/>Holds Signature_1<br/>Proposes transactions"]
-    AA["Auditor Agent<br/>Risk policy engine<br/>Decides Signature_2"]
-    CU["Custody Layer<br/>HSM / KMS<br/>Non-exportable key"]
-    XR["XRPL Network<br/>Requires both signatures"]
-    CO["Compliance Officer<br/>MFA-authenticated override"]
+    EA["Execution Agent<br/>proposes a transaction"]
+    TR["TierRouter<br/>routes by value + RWA flags"]
+    CC["Channel-Custody Lane<br/>audited at open/close only"]
+    FP["Velocity-Bounded Fast Path<br/>lighter audit, LastLedgerSequence expiry"]
+    QB["2-of-2 Quorum Backstop<br/>full audit — always used for RWA"]
+    SB["SignerBackend(s)<br/>Local Encrypted Keystore | AWS KMS"]
+    XR["XRP Ledger"]
 
-    EA -->|"proposes tx"| AA
-    AA -->|"approved: policy token"| CU
-    CU -->|"2-of-2 signed"| XR
-    CO -.->|"verified override,<br/>bound to tx_hash"| CU
+    EA --> TR
+    TR -->|"low value"| CC
+    TR -->|"mid value"| FP
+    TR -->|"high value / RWA"| QB
+    CC --> SB
+    FP --> SB
+    QB --> SB
+    SB --> XR
 ```
 
 | Component | Responsibility | What it must NEVER do |
 |---|---|---|
-| **Execution Agent** | Generates transaction proposals, holds `Signature_1` | Never has network access to the Auditor's signing key or the custody layer |
-| **Auditor Agent** | Evaluates every proposal against risk rules; decides whether `Signature_2` is produced | Never signs a transaction it hasn't itself evaluated; never lets the Execution Agent call it directly for a signature |
-| **Custody layer (HSM/KMS)** | Physically holds the private key; performs the actual signing | Never exports the private key; never signs without a valid policy-approval token |
-| **Compliance Officer** | Can authorize a flagged transaction, or reset a tripped circuit breaker | Their override is bound to a specific `tx_hash`, never to free text — it can't be reused for a different transaction |
-
-### Risk policy: three rules, two severities
-
-| Rule | Severity | Effect |
-|---|---|---|
-| Value threshold exceeded | `YELLOW` | `Signature_2` withheld for **that transaction**; requires a human override to broadcast |
-| Untrusted / non-whitelisted destination | `RED` | `Signature_2` withheld **and** the circuit breaker freezes — every subsequent transaction is blocked until a human resets it |
-| Anomalous transaction velocity (loop detection) | `RED` | Same as above — freezes the breaker |
-
-**Compound risk accumulation**: if a transaction fires more than one rule at once (e.g. it's both over the value threshold *and* part of a detected loop), every fired reason is accumulated and reported — not just whichever one happened to be the hard trigger. This is what makes the plain-English `explain_my_position()` output trustworthy as an audit trail.
+| **Execution Agent** | Generates transaction proposals | Never has direct access to a signing key or the custody layer |
+| **Auditor Agent / risk engine** | Evaluates every proposal against policy (value threshold, whitelist, velocity, RWA compliance) | Never signs a transaction it hasn't itself evaluated |
+| **TierRouter** | Picks the assurance lane by value; RWA-flagged transactions always escalate to the quorum backstop | Never let "lighter audit" relax the cryptographic quorum itself — only the policy scrutiny |
+| **SignerBackend (keystore / KMS)** | Holds the actual signing key, produces `TxnSignature`s | Never expose plaintext key material to disk or logs |
 
 ---
 
-## How to run the simulation
+## Repository layout
 
-The entire prototype is a single, dependency-free Python file — no `pip install`, no API keys, no network access required.
+```
+quorumvault/
+├── signing/            the signing seam and its backends
+│   ├── backend.py       SignerBackend — the interface everything else depends on
+│   ├── keystore.py      AES-256-GCM + scrypt encrypted keystore, no plaintext at rest
+│   ├── local_keystore.py  LocalEncryptedKeystoreBackend (ed25519 or secp256k1)
+│   ├── kms_backend.py   AwsKmsSignerBackend (non-exportable secp256k1)
+│   └── quorum_signer.py QuorumSigner — combines backends into one multisigned tx
+├── policy/             the risk rules
+│   ├── risk_engine.py   value / whitelist / velocity rules + circuit breaker
+│   ├── pricing.py       injectable RateProvider (no hardcoded exchange rate)
+│   └── rwa_rule.py      RWA compliance rule (MPTs, Credentials, Domains, Clawback)
+├── tiers/              the v2 assurance lanes
+│   ├── channel_custody.py  Payment-Channel lane (audited at open/close only)
+│   ├── fast_path.py     Velocity-Bounded Fast Path (LastLedgerSequence expiry)
+│   └── router.py        TierRouter — picks the lane by value
+└── tools/
+    └── migrate_keystore.py  import a plaintext checkpoint → encrypted keystore, then shred
 
-### Requirements
+tests/                          56 tests, fully offline, no network calls
+testnet_multisig_demo.py        v1 — the original real Testnet proof (hashes above)
+testnet_multisig_demo_v2.py     v2 — refactored onto the signing abstraction + tiers
+xrpl_auditor_production_blueprint.py   the original design prototype (see below)
+requirements.txt
+LICENSE
+```
 
-- Python 3.9 or later
-- Standard library only (`hashlib`, `hmac`, `secrets`, `time`, `collections`, `enum`)
+---
 
-### Run it
+## The signing abstraction
+
+Everything above signing depends on one interface:
+
+```python
+class SignerBackend(ABC):
+    public_key: str          # XRPL hex pubkey (ED… or 02/03…)
+    classic_address: str     # r…
+    algorithm: str           # "ed25519" | "secp256k1"
+    def sign(self, signing_blob: bytes) -> str: ...   # -> TxnSignature hex
+```
+
+`QuorumSigner([backend_a, backend_b]).multisign(tx)` produces a transaction that is **byte-for-byte identical** to xrpl-py's own `sign(multisign=True)` + `multisign()` — asserted directly in `tests/test_quorum_signer.py`. Swapping keystore ↔ HSM/KMS is invisible above this line. `tests/test_mixed_backend_quorum.py` proves a single quorum can mix an ed25519 local-keystore signer with a secp256k1 KMS signer with no change to the quorum logic itself.
+
+---
+
+## v2 tiered assurance model
+
+*"Safe at any speed, honest at any scale."* The proven 2-of-2 quorum stays as the high-value backstop; three lanes route each payment to the assurance level its stakes actually require:
+
+| Lane | Audit point | Use case |
+|---|---|---|
+| **Channel-Custody** | Audited at open (2-of-2) and close; capacity policy-bounded | High-frequency, low-value payments via XRPL Payment Channels |
+| **Velocity-Bounded Fast Path** | Lighter, auto-co-signed audit; on-ledger `LastLedgerSequence` expiry | Mid-value payments; over-ceiling or over-velocity escalates to the quorum |
+| **2-of-2 Quorum Backstop** | Full audit, both signers | High-value transfers, and **always** RWA-flagged transactions regardless of size |
+
+The RWA compliance rule is aware of MPTs, Credentials, Permissioned Domains, and Clawback — any RWA exposure escalates to the full quorum, no matter which lane a payment would otherwise route to.
+
+---
+
+## Quickstart
 
 ```bash
 git clone https://github.com/QuorumVaultXRPL/quorumvault.git
 cd quorumvault
-python3 xrpl_auditor_production_blueprint.py
+pip install -r requirements.txt        # boto3 only needed for the AWS KMS backend
+
+# Full offline test suite — 56 tests, no network calls
+python -m pytest tests/ -q
+
+# Offline dry run: tiered routing + a real 2-of-2 multisign, no broadcast
+python testnet_multisig_demo_v2.py
+
+# The original v1 proof against live XRPL Testnet (tx hashes above)
+python testnet_multisig_demo.py
 ```
 
-That's it — the script runs a 7-scenario demo end to end and prints a full audit trail to your terminal in a few milliseconds.
+Live Testnet broadcast via the v2 demo is opt-in and double-gated:
+
+```bash
+export QUORUMVAULT_CONFIRM_TESTNET=yes
+export QUORUMVAULT_TREASURY_ADDRESS=r...
+python testnet_multisig_demo_v2.py --submit
+```
 
 ---
 
-## What to look for in the output
+## Security tradeoffs (flagged, not hidden)
 
-The demo walks through a realistic escalation sequence. Watch for these specific moments:
-
-1. **Scenario 1** — a small, clean transaction is auto-approved with a full 2-of-2 multisig. No human involved.
-2. **Scenarios 2–3** — a transaction over the value threshold gets `Signature_2` **withheld**. The broadcast is blocked (`MissingSignaturesError`), then succeeds only after a `HumanOverrideAuthority` token — cryptographically bound to that exact transaction's hash — is supplied.
-3. **Scenario 4 — compound risk accumulation** — a third identical request in the same short window triggers *two* rules simultaneously (value threshold **and** loop detection). The output explicitly lists both accumulated reasons, and the circuit breaker trips.
-4. **Scenario 5** — a completely unrelated, individually clean $10 transaction is still blocked, because the circuit breaker is now a persistent freeze, not a per-transaction filter. This is the difference between a "circuit breaker" and a simple threshold check.
-5. **Scenarios 6–7** — a compliance officer resets the breaker with its own verified authorization, and normal automatic operation resumes.
-
-If you want to explore beyond the demo, `run_demo()` at the bottom of the file is a good starting point to copy and modify — try changing `frequency_limit`, `amount_threshold_rlusd`, or feeding in your own transaction sequences via `MockTransactionPayload.from_dict()`.
+1. **ed25519 vs. cloud HSM/KMS.** AWS/GCP KMS can only sign **secp256k1**, not ed25519 — today's Testnet signers are ed25519. The local encrypted keystore works with them today, no migration required; moving a signer to `AwsKmsSignerBackend` means adding a secp256k1 key to the treasury's `SignerListSet` one signer at a time (or using an ed25519-capable backend such as HashiCorp Vault, same interface).
+2. **The encrypted keystore is not an HSM.** It never writes plaintext key material to disk, but it must decrypt into process memory to sign, and Python cannot guarantee that memory is wiped. This is the floor for "near funds," not the ceiling — only a real HSM/KMS (key never leaves the boundary) closes that gap.
+3. **Channel capacity is the audited exposure window.** The Channel-Custody lane is audited only at open and close; the capacity set at open is the bound on what could go wrong between them, and anything larger routes to the quorum instead.
+4. **Value routing depends on a live rate.** Every tier boundary is denominated in RLUSD-equivalent value, so the exchange rate is an injected `RateProvider`, never a hardcoded constant — a stale price would otherwise silently misroute a transaction into a less-audited tier. `StaticRateProvider` is a clearly labelled Testnet placeholder (`is_live == False`); production requires a staleness-guarded `CallableRateProvider` wrapping a live feed.
 
 ---
 
-## Production roadmap
+## Roadmap
 
-This prototype proves the *logic*. None of the following exists yet, and all of it is required before this touches a real XRPL account:
+- [x] Real XRPL Testnet 2-of-2 quorum, treasury master key disabled, multisigned payment
+- [x] Signing abstraction (`SignerBackend`) with interchangeable local-keystore and AWS KMS implementations
+- [x] AES-256-GCM + scrypt encrypted keystore — no plaintext key material at rest or in logs
+- [x] Tiered routing: Channel-Custody lane, Velocity-Bounded Fast Path, 2-of-2 quorum backstop
+- [x] RWA compliance rule (MPTs, Credentials, Permissioned Domains, Clawback)
+- [ ] Live AWS KMS run against a real secp256k1 signer (current KMS backend is tested against a mock)
+- [ ] RWA rule wired to live ledger reads (currently reasons over a supplied compliance context)
+- [ ] SSO + hardware MFA (FIDO2/WebAuthn) for human overrides, replacing the current bare-token model
+- [ ] Independent security audit — required before any of this touches Mainnet or real funds
 
-- [ ] **HSM / KMS integration** — replace the in-memory HMAC "signing" with real custody: AWS CloudHSM/KMS, GCP Cloud HSM, Azure Managed HSM, or an MPC custody provider (Fireblocks, Copper). The private key must never exist in application memory.
-- [ ] **XRPL Testnet wiring** — integrate [`xrpl-py`](https://github.com/XRPLF/xrpl-py) for real transaction serialization and submission. Configure the treasury account on-ledger via `SignerListSet` with the Execution Agent and Auditor as two signer entries and a quorum weight requiring both.
-- [ ] **Real signature schemes** — move from toy HMAC strings to actual XRPL-supported `secp256k1` or `ed25519` signatures over the canonical transaction blob.
-- [ ] **Service-level network separation** — split `ExecutionAgent` and `AuditorAgent` into two independently deployed services communicating over mTLS, so a compromised Execution Agent has no network path to the Auditor's signing capability.
-- [ ] **SSO + hardware MFA for human overrides** — replace `HumanOverrideAuthority`'s bare HMAC key with a real identity provider integration (FIDO2/WebAuthn), and route overrides through an approval workflow product rather than a raw function call.
-- [ ] **Tamper-evident audit logging** — write every signing decision and override to an append-only log independent of the application database (e.g. AWS CloudTrail for KMS operations, or a dedicated SIEM).
-- [ ] **Independent security audit** — required before any real funds are placed under this system's custody. A misconfigured KMS key policy or an unreviewed override path is a realistic, high-severity failure mode.
+---
 
-Full architectural detail for each of these is in the `SYSTEM_ARCHITECTURE_SPEC` docstring at the bottom of `xrpl_auditor_production_blueprint.py`.
+## Original design prototype
+
+`xrpl_auditor_production_blueprint.py` is the project's original logic-only prototype: no XRPL dependency, no real cryptography (HMACs stand in for signatures), written to prove out the risk-engine and human-override logic before any real ledger integration existed. It's kept for its `SYSTEM_ARCHITECTURE_SPEC` docstring — the original network-separation and HSM/KMS production rationale, which the `quorumvault/` package above now actually implements.
+
+```bash
+python3 xrpl_auditor_production_blueprint.py   # the original 7-scenario risk-escalation demo
+```
+
+For anything real, use `quorumvault/`.
 
 ---
 
 ## Safety notice
 
-- This code performs **no real cryptographic custody**. All "signatures" are HMACs over formatted strings, held in local Python process memory.
-- This code has **no connection to the live XRP Ledger**, testnet or mainnet.
-- This code has **not been security audited**.
-- Do not connect this prototype to any wallet, exchange account, or system with access to real funds.
+- **Testnet only.** Nothing in this repository has been deployed to XRPL Mainnet or connected to real funds.
+- The `quorumvault/` signing and custody code is real — real keys, real ed25519/secp256k1 signatures, real on-ledger multisig — but it has **not yet been through an independent security audit**, which is a hard prerequisite before any real-funds use.
+- `xrpl_auditor_production_blueprint.py` alone performs no real cryptography and has no ledger connection whatsoever (see above).
 
 ## License
 
