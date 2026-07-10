@@ -1,0 +1,146 @@
+# QuorumVault v2 — signing abstraction & tiered architecture
+
+This package turns the proven v1 Testnet 2-of-2 quorum into production-shaped
+code: a swappable signing abstraction where **no plaintext key material ever
+touches disk or logs**, and a tiered assurance model that routes each payment to
+the right lane by its stakes, with the 2-of-2 quorum kept underneath as the
+high-value backstop.
+
+Everything here targets **XRPL Testnet only**. The package itself makes no
+network calls; the only place that can broadcast is the demo's opt-in `--submit`
+path, and it is hard-wired to the Testnet endpoint.
+
+## Layout
+
+```
+quorumvault/
+  signing/     the signing seam and its backends
+    backend.py         SignerBackend (the interface everything depends on)
+    keystore.py        AES-256-GCM + scrypt encrypted keystore (no plaintext at rest)
+    local_keystore.py  LocalEncryptedKeystoreBackend (ed25519 or secp256k1)
+    kms_backend.py     AwsKmsSignerBackend (non-exportable secp256k1)
+    quorum_signer.py   QuorumSigner — combines backends into a multisigned tx
+  policy/      the risk rules
+    risk_engine.py     v1's three rules (value/whitelist/velocity) + circuit breaker
+    rwa_rule.py        the 4th rule: RWA compliance (MPT/Credentials/Domains/Clawback)
+  tiers/       the v2 assurance lanes
+    channel_custody.py Payment-Channel lane (audited at open/close only)
+    fast_path.py       Velocity-Bounded Fast Path (LastLedgerSequence expiry)
+    router.py          TierRouter (picks the lane by value; RWA always -> quorum)
+  tools/
+    migrate_keystore.py  import plaintext checkpoint -> encrypted keystore, then shred
+```
+
+## The one seam that matters
+
+Everything above signing depends only on `SignerBackend`:
+
+```python
+class SignerBackend(ABC):
+    public_key: str          # XRPL hex pubkey (ED… or 02/03…)
+    classic_address: str     # r…
+    algorithm: str           # "ed25519" | "secp256k1"
+    def sign(self, signing_blob: bytes) -> str: ...   # -> TxnSignature hex
+```
+
+`QuorumSigner([backend_a, backend_b]).multisign(tx)` produces a transaction that
+is **byte-for-byte identical** to xrpl-py's own `sign(multisign=True)` +
+`multisign()` — see `tests/test_quorum_signer.py`. The only thing a backend
+changes is *where the signature comes from*. `tests/test_mixed_backend_quorum.py`
+proves a single quorum can mix an ed25519 local-keystore signer with a
+secp256k1 KMS signer, with the quorum logic above unchanged.
+
+## Security tradeoffs (flagged, not hidden)
+
+1. **ed25519 keys vs. cloud HSM/KMS.** The current Testnet signers are ed25519.
+   AWS/GCP KMS can only sign **secp256k1**, not ed25519. So:
+   - The **local encrypted keystore** works with the existing ed25519 signers
+     today, no migration.
+   - Adopting `AwsKmsSignerBackend` (non-exportable key, strongest posture)
+     means putting a **secp256k1** key in KMS and adding it to the treasury's
+     `SignerListSet`. Because signer entries are per-account, you can migrate
+     **one signer at a time**. Alternatively use an ed25519-capable backend
+     (HashiCorp Vault transit) — the interface is identical.
+
+2. **Encrypted keystore is weaker than an HSM.** The keystore never writes
+   plaintext to disk, but it must decrypt the seed into process memory to sign,
+   and Python cannot guarantee that memory is wiped (immutable `str`
+   intermediates, allocator reuse, core dumps). This is the *minimum* acceptable
+   posture near funds — "secrets-manager-backed keystore" — not the strongest.
+   Only KMS/HSM (key never leaves the boundary) closes this gap.
+
+3. **Channel capacity is un-audited exposure.** The Channel-Custody lane audits
+   only at open and close. Between them, the Execution Agent's channel key
+   single-signs claims up to capacity with no per-payment audit. Therefore the
+   **channel capacity is the risk budget** and is bounded by the auditor at open
+   (`capacity_cap_drops`); anything larger routes to the 2-of-2 quorum.
+
+A fourth, smaller one worth knowing: `AwsKmsSignerBackend` normalizes KMS's
+ECDSA signatures to **low-S** because KMS does not guarantee canonical
+signatures and the XRPL rejects high-S. Covered by `tests/test_kms_backend.py`.
+
+## Migrate off plaintext seeds
+
+```bash
+export QUORUMVAULT_KEYSTORE_PASSPHRASE='…'          # never stored or echoed
+python -m quorumvault.tools.migrate_keystore \
+    --checkpoint wallets_checkpoint.json \
+    --keystore keystore.json \
+    --shred                                          # secure-delete the plaintext after verify
+```
+
+The treasury seed is skipped by default (its master key is disabled on-ledger,
+so it can no longer sign anything). Note the shred caveat: on SSD/CoW/journaled
+filesystems the original bytes may still be recoverable, so for real funds treat
+any machine that held the plaintext as needing key rotation.
+
+## Run it
+
+```bash
+pip install "xrpl-py>=5" cryptography           # boto3 only if you use the KMS backend
+export QUORUMVAULT_KEYSTORE_PASSPHRASE='…'
+
+python testnet_multisig_demo_v2.py              # offline dry run: routing + 2-of-2 multisign
+python -m pytest tests/ -q                      # 50 tests, all offline
+
+# Opt-in live Testnet broadcast (Testnet only, double-gated):
+export QUORUMVAULT_CONFIRM_TESTNET=yes
+export QUORUMVAULT_TREASURY_ADDRESS=r…
+python testnet_multisig_demo_v2.py --submit
+```
+
+## Not done yet / next
+
+- HSM/KMS is a *reference* adapter tested against a mock; a live KMS run needs a
+  secp256k1 key and a `SignerListSet` update on the treasury.
+- Human-override path is still the v1 model; production wants SSO + hardware MFA
+  (FIDO2/WebAuthn) bound to the tx hash.
+- The RWA rule reasons over a supplied compliance context; wiring it to live
+  ledger reads (MPT issuance flags, credential/domain objects) is the next step.
+- No independent security audit. Required before any of this touches real funds.
+
+## Post-review refinements (2026-07-10)
+
+**Value conversion is injectable, not a constant.** The XRP->RLUSD rate that
+every value-based decision depends on (tier routing, fast-path ceiling, the risk
+engine's value threshold) is a `RateProvider`, not a hardcoded number. A stale
+rate would otherwise silently misroute a transaction into a less-audited tier, or
+let an over-threshold transfer skip the value gate. `StaticRateProvider` is a
+labelled Testnet placeholder (`is_live == False`); for real funds inject a
+`CallableRateProvider` wrapping a live feed, with `max_age_s` set so a stale
+price raises `StaleRateError` instead of being routed on.
+
+**Keystore nuance (4th tradeoff).** The backend no longer retains the passphrase
+for its lifetime. On the production path (no explicit passphrase) it resolves
+`QUORUMVAULT_KEYSTORE_PASSPHRASE` fresh on each `sign()` and stores no secret; an
+explicit provider callable (e.g. an OS-keyring lookup) is invoked per signature.
+The env var itself remains the secret's home, so protect the process environment.
+
+**Backend decision (recorded).** Local encrypted keystore only for now — it's
+ed25519-native (zero migration) and already removes the actual problem (the
+plaintext seed file). Do **not** migrate to AWS KMS before the security audit
+that gates real funds: solving HSM custody early means a real operational step
+(new secp256k1 key + `SignerListSet` update) to protect funds that aren't there
+yet. Revisit KMS vs. Vault at the audit, leaning Vault if forced to choose today
+(native ed25519, no forced key-scheme migration); reach for AWS KMS first only if
+standardizing on AWS for other reasons.
