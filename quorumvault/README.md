@@ -186,4 +186,75 @@ python testnet_multisig_demo_v2.py --submit
 
 **Value conversion is injectable, not a constant.** The XRP->RLUSD rate that
 every value-based decision depends on (tier routing, fast-path ceiling, the risk
-engine's value threshold) is a `RateProvider
+engine's value threshold) is a `RateProvider` — `StaticRateProvider` for Testnet
+(explicitly labelled `is_live=False`) or `CallableRateProvider` for a live feed,
+which raises `StaleRateError` rather than routing on a price older than
+`max_age_s`. No more `XRP_TO_RLUSD_RATE = 0.55` duplicated across the router,
+fast path, and risk engine.
+
+**The local keystore no longer retains the passphrase.**
+`LocalEncryptedKeystoreBackend` resolves it on demand instead of holding it for
+the life of the object — the env-var path holds nothing at rest, and a
+provider callable can pull from a keyring or secrets manager instead.
+
+**Backend decision: local encrypted keystore only, for now.** No AWS KMS
+migration before the security audit; that choice gets revisited at the audit
+(leaning toward HashiCorp Vault over KMS, since Vault supports ed25519
+natively and the treasury's signers already do too). Plaintext migration
+(`migrate_keystore --shred`) is safe to run whenever you're ready to move off
+the checkpoint file.
+
+## Integration: XRPL Agent Wallet Skill (ExternalSigner) — proven on Testnet
+
+Ripple's XRPL Agent Wallet Skill (xrpl.org/docs/agents/xrpl-agent-wallet-skill)
+is explicit that multisig is out of scope: "Multisig. Not in scope ... the
+developer needs a dedicated multisig flow." QuorumVault is that flow.
+
+`quorumvault/integrations/external_signer.py` implements the skill's own
+`ExternalSigner` contract — `{ address: string; sign(tx) ->
+Promise<{tx_blob, hash}> }` — backed by the full stack above: `TierRouter`
+picks the lane, `RiskEngine` (now RWA-aware) evaluates it, and only a GREEN
+verdict produces `QuorumSigner.multisign()`'s output; anything else raises
+`ExternalSignerRefused` rather than returning a signature, i.e. Signature_2 is
+withheld, not just discouraged. `quorumvault/integrations/agent_wallet_ceremony.py`
+is a faithful Python simulation of the skill's documented six-step ceremony:
+receive tx + apply the default SourceTag (20260530) unless one is already set,
+match the signer to the tx's Account, autofill, render the skill's exact
+preview block, get human confirmation, sign and persist the hash *before*
+submitting, then `submitAndWait`.
+
+**Decision (a vs b).** The skill is a Claude-agent skill — prose plus xrpl.js
+snippets — and its `ExternalSigner` is a contract the *host* provides. Two
+ways to prove QuorumVault satisfies it: (a) a thin xrpl.js/TypeScript shim
+that RPCs into QuorumVault so it sits behind a real Claude agent running the
+actual skill, or (b) a faithful Python-side simulation of the ceremony,
+driving the same `ExternalSigner` object directly. We built (b): it proves
+the contract end-to-end to a real on-ledger hash with no TS<->Python bridge to
+stand up and nothing to fork in the skill itself. Because
+`QuorumVaultExternalSigner` already has the exact `ExternalSigner` shape, (a)
+is a transport wrapper away, not a proof gap — documented here as the
+production path rather than built for this round.
+
+**Proven on Testnet.** A fresh 2-of-2 treasury (`SignerListSet`, master key
+disabled), signer seeds in an encrypted keystore, run through the ceremony end
+to end: a validated 2-of-2 multisig Payment via the skill's own flow — tx
+`B52360E50C4C1B2F0A7AEBD4168C71574B163089C6E151EA6263DD7EFE49582B`.
+Independently re-queried on-ledger: validated, `tesSUCCESS`, empty
+`SigningPubKey`, 2 `Signers` (ed25519), `SourceTag` 20260530.
+
+**Hardened after an adversarial review.** Two real bugs were found and fixed
+in `external_signer.py` (nothing else touched): the transaction-intent parser
+could default an unparsed amount to `0.0` instead of refusing, making the
+value check vacuous for any non-Payment or IOU/MPT-typed-object transaction —
+closed by refusing outright (`ExternalSignerRefused`) on any unparseable
+amount or missing destination, never defaulting to zero. And the RWA rule
+could be silently bypassed because nothing wired a real `RwaTransfer` into
+non-Payment-shaped or MPT transactions — closed by adding a
+`compliance_reader` parameter the signer now requires (fail-closed) before it
+will sign any MPT transfer at all. `signable_transaction_types` now also
+defaults to `{"Payment"}` and is checked *before* risk scoring, so an
+unsupported transaction type (e.g. `SignerListSet`) is refused outright rather
+than ever reaching the risk engine — covered by a regression test that
+deliberately whitelists the treasury address to prove it's the type gate, not
+the value/whitelist checks, doing the refusing. +17 adversarial tests, 101
+total, all passing.
