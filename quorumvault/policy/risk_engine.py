@@ -1,6 +1,6 @@
 """RiskEngine - the v1 three rules plus the v2 RWA rule, unified.
 
-Ported from xrpl_auditor_production_blueprint.py with its behavior intact:
+Ported from legacy/xrpl_auditor_production_blueprint.py with its behavior intact:
 compound-reason accumulation, and a persistent RED circuit-breaker freeze that
 forces every subsequent transaction RED until a human reset. The RWA rule is
 folded in as a fourth rule so its findings accumulate and trip the breaker the
