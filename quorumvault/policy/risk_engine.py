@@ -7,15 +7,23 @@ folded in as a fourth rule so its findings accumulate and trip the breaker the
 same way the whitelist and velocity rules do. The value threshold uses the same
 injectable rate provider as the router/fast-path, so a stale XRP price can't
 silently skip it.
+
+All money values here (the threshold, the computed RLUSD-equivalent, the
+overage) are :class:`~decimal.Decimal` — see :mod:`quorumvault.policy.money`.
+A bare ``max(0.0, ...)`` would silently leak a float back into an otherwise-
+exact result whenever the overage is zero or negative, which is why the floor
+below is ``Decimal("0")``, not ``0.0``.
 """
 
 from __future__ import annotations
 
 from collections import deque
+from decimal import Decimal
 from enum import Enum
 from typing import List, Optional, Tuple
 
 from .intent import PaymentIntent
+from .money import Numeric, to_decimal
 from .pricing import RateProvider, default_rate_provider
 from .rwa_rule import RwaComplianceRule
 
@@ -30,14 +38,14 @@ class RiskEngine:
     def __init__(
         self,
         whitelist,
-        amount_threshold_rlusd: float = 5000.0,
+        amount_threshold_rlusd: Numeric = Decimal("5000"),
         frequency_window_s: float = 60.0,
         frequency_limit: int = 3,
         rwa_rule: Optional[RwaComplianceRule] = None,
         rate_provider: RateProvider = None,
     ):
         self.whitelist = set(whitelist)
-        self.amount_threshold_rlusd = amount_threshold_rlusd
+        self.amount_threshold_rlusd = to_decimal(amount_threshold_rlusd)
         self.frequency_window_s = frequency_window_s
         self.frequency_limit = frequency_limit
         self.rwa_rule = rwa_rule or RwaComplianceRule()
@@ -48,7 +56,7 @@ class RiskEngine:
         self.trip_reasons: List[str] = []
         self.audit_log: List[dict] = []
 
-    def _to_rlusd_equivalent(self, asset: str, amount: float) -> float:
+    def _to_rlusd_equivalent(self, asset: str, amount: Numeric) -> Decimal:
         return self.rate_provider.to_rlusd(asset, amount)
 
     def _prune_log(self, now: float) -> None:
@@ -61,7 +69,7 @@ class RiskEngine:
     def evaluate(self, intent: PaymentIntent) -> dict:
         rlusd_equiv = self._to_rlusd_equivalent(intent.asset, intent.amount)
         amount_flag = rlusd_equiv > self.amount_threshold_rlusd
-        overage = max(0.0, rlusd_equiv - self.amount_threshold_rlusd)
+        overage = max(Decimal("0"), rlusd_equiv - self.amount_threshold_rlusd)
         whitelist_flag = intent.destination not in self.whitelist
 
         self._prune_log(intent.timestamp)

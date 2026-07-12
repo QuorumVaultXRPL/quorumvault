@@ -15,13 +15,22 @@ So the rate is a :class:`RateProvider`, injected wherever value is judged:
 * :class:`CallableRateProvider` — wraps a live price function, with an optional
   staleness guard that refuses to answer with a too-old price rather than
   misrouting on it.
+
+All amounts and rates here are :class:`~decimal.Decimal`, not ``float`` — see
+:mod:`quorumvault.policy.money`. ``to_rlusd`` coerces defensively at the
+boundary so a caller handing it a raw ``float`` or ``int`` (bypassing
+``PaymentIntent``) still gets an exact Decimal result, never a binary-float
+rounding artifact.
 """
 
 from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
+from decimal import Decimal
 from typing import Callable, Optional, Tuple, Union
+
+from .money import Numeric, to_decimal
 
 
 class StaleRateError(Exception):
@@ -32,7 +41,7 @@ class RateProvider(ABC):
     """Convert an asset amount to its RLUSD-equivalent for policy decisions."""
 
     @abstractmethod
-    def to_rlusd(self, asset: str, amount: float) -> float: ...
+    def to_rlusd(self, asset: str, amount: Numeric) -> Decimal: ...
 
     @property
     def is_live(self) -> bool:
@@ -43,13 +52,15 @@ class RateProvider(ABC):
 class StaticRateProvider(RateProvider):
     """A fixed XRP->RLUSD rate. A placeholder for Testnet, not a price feed."""
 
-    def __init__(self, xrp_to_rlusd: float, source: str = "static-placeholder"):
+    def __init__(self, xrp_to_rlusd: Numeric, source: str = "static-placeholder"):
+        xrp_to_rlusd = to_decimal(xrp_to_rlusd)
         if xrp_to_rlusd <= 0:
             raise ValueError("xrp_to_rlusd must be positive")
         self.xrp_to_rlusd = xrp_to_rlusd
         self.source = source
 
-    def to_rlusd(self, asset: str, amount: float) -> float:
+    def to_rlusd(self, asset: str, amount: Numeric) -> Decimal:
+        amount = to_decimal(amount)
         if asset == "RLUSD":
             return amount
         if asset == "XRP":
@@ -81,7 +92,7 @@ class CallableRateProvider(RateProvider):
     def is_live(self) -> bool:
         return True
 
-    def _rate(self) -> float:
+    def _rate(self) -> Decimal:
         result = self._price_fn()
         if isinstance(result, tuple):
             rate, as_of = result
@@ -92,12 +103,13 @@ class CallableRateProvider(RateProvider):
                 )
         else:
             rate = result
-        rate = float(rate)
+        rate = to_decimal(rate)
         if rate <= 0:
             raise StaleRateError("Live XRP price returned a non-positive rate.")
         return rate
 
-    def to_rlusd(self, asset: str, amount: float) -> float:
+    def to_rlusd(self, asset: str, amount: Numeric) -> Decimal:
+        amount = to_decimal(amount)
         if asset == "RLUSD":
             return amount
         if asset == "XRP":
@@ -107,4 +119,4 @@ class CallableRateProvider(RateProvider):
 
 def default_rate_provider() -> RateProvider:
     """The Testnet default: a labelled static placeholder (0.55). NOT for real funds."""
-    return StaticRateProvider(0.55, source="testnet-default-placeholder")
+    return StaticRateProvider(Decimal("0.55"), source="testnet-default-placeholder")

@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import List, Optional
+
+from .money import to_decimal
 
 
 @dataclass(frozen=True)
@@ -53,12 +56,22 @@ class RwaTransfer:
 
 @dataclass
 class PaymentIntent:
-    """A proposed outbound transfer from the treasury."""
+    """A proposed outbound transfer from the treasury.
+
+    ``amount`` is normalized to :class:`~decimal.Decimal` in ``__post_init__``,
+    whatever type it arrives as (int, str, a float literal, or already a
+    Decimal). Money is never left as a bare float past construction here — a
+    binary float silently rounds in a way a decimal amount must not. See
+    :mod:`quorumvault.policy.money` for the coercion rule and why.
+    """
 
     destination: str
     asset: str
-    amount: float
+    amount: Decimal
     purpose: str = "unspecified"
     timestamp: float = field(default_factory=time.time)
     rwa: Optional[RwaTransfer] = None
     tx_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        self.amount = to_decimal(self.amount)
