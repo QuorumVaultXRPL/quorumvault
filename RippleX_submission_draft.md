@@ -24,7 +24,7 @@ XRPL itself was built on a similar premise: give the network genuinely different
 **The solution — v1, live today:**
 QuorumVault's foundation targets infrequent, high-value corporate treasury transactions, where the cost of a single bad outcome justifies requiring two cryptographically independent parties to agree — not one risk model. The architecture separates the entity that decides whether a transaction is safe (the Auditor Agent) from the entity that can sign it (a 2-of-2 multisig quorum), so no single compromised component — including the Auditor Agent itself — can move funds alone. Unlike custody-as-a-service models, the institution never hands wallet control to a third party at all.
 
-Core logic (risk policy, circuit breaker, compound risk accumulation, human override bound to a specific tx hash) is implemented and demonstrated in a 7-scenario simulation: `xrpl_auditor_production_blueprint.py` in the repo above.
+Core logic (risk policy, circuit breaker, compound risk accumulation, human override bound to a specific tx hash) is implemented in `quorumvault/policy/` and covered by the automated test suite referenced below. The earliest version of this logic was proven out in a standalone 7-scenario simulation before any ledger integration existed (`legacy/xrpl_auditor_production_blueprint.py` in the repo); that prototype is superseded by the tested, Testnet-proven package described from here on.
 
 **Real on-ledger proof (XRPL Testnet):**
 We've moved beyond simulation and executed the actual multisig mechanics on XRPL Testnet — not a mock:

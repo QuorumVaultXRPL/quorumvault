@@ -10,6 +10,8 @@ Autonomous trading and treasury agents are increasingly authorized to move real 
 
 > **Current status:** the 2-of-2 quorum, the signing abstraction, and the tiered routing described below are implemented and proven against XRPL Testnet with real transactions (hashes below), not simulated ones. Nothing here has touched Mainnet or real funds, and none of it has been through an independent security audit yet. See [Roadmap](#roadmap).
 
+> **New here? Start with [`quorumvault/`](quorumvault/).** That's the real, tested (101 tests), Testnet-proven implementation — everything in this README describes it. This repo also keeps one historical, superseded prototype in [`legacy/`](legacy/) for its design-rationale docstring only; it has no ledger connection, no real cryptography, and does not reflect current functionality. See [Original design prototype](#original-design-prototype) if you're curious about its history, otherwise ignore it.
+
 ---
 
 ## Table of contents
@@ -107,10 +109,13 @@ quorumvault/
 └── tools/
     └── migrate_keystore.py  import a plaintext checkpoint → encrypted keystore, then shred
 
-tests/                          76 tests, fully offline, no network calls
+tests/                          101 tests, fully offline, no network calls
 testnet_multisig_demo.py        v1 — the original real Testnet proof (hashes above)
 testnet_multisig_demo_v2.py     v2 — refactored onto the signing abstraction + tiers
-xrpl_auditor_production_blueprint.py   the original design prototype (see below)
+legacy/
+└── xrpl_auditor_production_blueprint.py   superseded logic-only prototype, kept for its
+                                            architecture-spec docstring only (see below) —
+                                            not part of the current implementation
 requirements.txt
 LICENSE
 ```
@@ -154,7 +159,7 @@ git clone https://github.com/QuorumVaultXRPL/quorumvault.git
 cd quorumvault
 pip install -r requirements.txt        # boto3 only needed for the AWS KMS backend
 
-# Full offline test suite — 76 tests, no network calls
+# Full offline test suite — 101 tests, no network calls
 python -m pytest tests/ -q
 
 # Offline dry run: tiered routing + a real 2-of-2 multisign, no broadcast
@@ -199,13 +204,13 @@ python testnet_multisig_demo_v2.py --submit
 
 ## Original design prototype
 
-`xrpl_auditor_production_blueprint.py` is the project's original logic-only prototype: no XRPL dependency, no real cryptography (HMACs stand in for signatures), written to prove out the risk-engine and human-override logic before any real ledger integration existed. It's kept for its `SYSTEM_ARCHITECTURE_SPEC` docstring — the original network-separation and HSM/KMS production rationale, which the `quorumvault/` package above now actually implements.
+`legacy/xrpl_auditor_production_blueprint.py` is the project's original logic-only prototype, moved out of the repo root into `legacy/` so it can't be mistaken for the current implementation. No XRPL dependency, no real cryptography (HMACs stand in for signatures) — it was written to prove out the risk-engine and human-override logic before any real ledger integration existed, and predates every Testnet proof above. It's kept only for its `SYSTEM_ARCHITECTURE_SPEC` docstring — the original network-separation and HSM/KMS production rationale, which the `quorumvault/` package now actually implements in real code.
 
 ```bash
-python3 xrpl_auditor_production_blueprint.py   # the original 7-scenario risk-escalation demo
+python3 legacy/xrpl_auditor_production_blueprint.py   # the original 7-scenario risk-escalation demo — historical only
 ```
 
-For anything real, use `quorumvault/`.
+**This file is not representative of QuorumVault's current capabilities and has no ledger connection.** For anything real — the actual risk engine, signing, tiers, and RWA compliance — use `quorumvault/`, proven above against live XRPL Testnet.
 
 ---
 
@@ -213,7 +218,7 @@ For anything real, use `quorumvault/`.
 
 - **Testnet only.** Nothing in this repository has been deployed to XRPL Mainnet or connected to real funds.
 - The `quorumvault/` signing and custody code is real — real keys, real ed25519/secp256k1 signatures, real on-ledger multisig — but it has **not yet been through an independent security audit**, which is a hard prerequisite before any real-funds use.
-- `xrpl_auditor_production_blueprint.py` alone performs no real cryptography and has no ledger connection whatsoever (see above).
+- `legacy/xrpl_auditor_production_blueprint.py` alone performs no real cryptography and has no ledger connection whatsoever — historical only (see above).
 
 ## License
 
