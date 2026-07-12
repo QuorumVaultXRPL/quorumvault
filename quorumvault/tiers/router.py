@@ -8,15 +8,21 @@ Value bands (RLUSD-equivalent, via an injectable rate provider):
 RWA transfers always escalate to the quorum backstop: tokenized real-world
 assets carry compliance obligations that must be checked on every transfer, so
 they never use the un-audited channel or the lighter fast path.
+
+Ceilings and the routed value are :class:`~decimal.Decimal` — see
+:mod:`quorumvault.policy.money` — so a band comparison is never decided by a
+binary-float rounding artifact.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import Enum
 from typing import List
 
 from ..policy.intent import PaymentIntent
+from ..policy.money import Numeric, to_decimal
 from ..policy.pricing import RateProvider, default_rate_provider
 
 
@@ -29,17 +35,19 @@ class Tier(Enum):
 @dataclass
 class RoutingDecision:
     tier: Tier
-    value_rlusd: float
+    value_rlusd: Decimal
     reasons: List[str] = field(default_factory=list)
 
 
 class TierRouter:
     def __init__(
         self,
-        channel_ceiling_rlusd: float,
-        fast_path_ceiling_rlusd: float,
+        channel_ceiling_rlusd: Numeric,
+        fast_path_ceiling_rlusd: Numeric,
         rate_provider: RateProvider = None,
     ):
+        channel_ceiling_rlusd = to_decimal(channel_ceiling_rlusd)
+        fast_path_ceiling_rlusd = to_decimal(fast_path_ceiling_rlusd)
         if not (0 < channel_ceiling_rlusd < fast_path_ceiling_rlusd):
             raise ValueError(
                 "require 0 < channel_ceiling_rlusd < fast_path_ceiling_rlusd"

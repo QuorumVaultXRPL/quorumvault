@@ -5,17 +5,24 @@ the auditor co-signs automatically instead of running the full review/override),
 NOT the cryptography: funds still leave the multisig treasury under a real 2-of-2
 signature. Expiry is enforced on-ledger via LastLedgerSequence so a co-signed but
 un-broadcast approval cannot be replayed and land later at a stale price.
+
+The value ceiling is a :class:`~decimal.Decimal` — see
+:mod:`quorumvault.policy.money` — for the same reason the router's ceilings are:
+a threshold that decides whether a transaction gets the lighter path must not be
+settled by a binary-float rounding artifact.
 """
 
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import List, Optional
 
 from xrpl.models.transactions import Payment
 
 from ..policy.intent import PaymentIntent
+from ..policy.money import Numeric, to_decimal
 from ..policy.pricing import RateProvider, default_rate_provider
 
 
@@ -30,7 +37,7 @@ class FastPathDecision:
 class VelocityBoundedFastPath:
     def __init__(
         self,
-        mid_value_cap_rlusd: float,
+        mid_value_cap_rlusd: Numeric,
         expiry_ledgers: int = 4,
         frequency_window_s: float = 60.0,
         frequency_limit: int = 5,
@@ -38,7 +45,7 @@ class VelocityBoundedFastPath:
     ):
         if expiry_ledgers <= 0:
             raise ValueError("expiry_ledgers must be positive")
-        self.mid_value_cap_rlusd = mid_value_cap_rlusd
+        self.mid_value_cap_rlusd = to_decimal(mid_value_cap_rlusd)
         self.expiry_ledgers = expiry_ledgers
         self.frequency_window_s = frequency_window_s
         self.frequency_limit = frequency_limit
