@@ -33,11 +33,18 @@ path would let the value gate go vacuous; they must be authorized out of band.
 Likewise, an amount this signer cannot parse into a real number is refused, never
 defaulted to zero (a zero amount would make the value threshold structurally
 unable to fire and route to the least-scrutinized lane).
+
+Amounts are parsed straight into :class:`~decimal.Decimal` from XRPL's own wire
+format (the drops string for XRP, the ``"value"`` decimal string for IOU/MPT) —
+never routed through ``float`` at all. See :mod:`quorumvault.policy.money` for
+why a bare float has no business carrying a currency amount anywhere in this
+codebase; a value the network itself sends as an exact string should stay exact.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import FrozenSet, Iterable, List, Optional
 
 from xrpl.core.binarycodec import encode
@@ -183,14 +190,33 @@ class QuorumVaultExternalSigner:
             domain_id=self._rwa_domain_id,
         )
 
+    @staticmethod
+    def _parse_decimal(raw: str, *, what: str) -> Decimal:
+        """Parse an XRPL wire-format numeric string into an exact Decimal.
+
+        Never falls through to ``float`` and never defaults to zero: a value
+        this signer can't parse is refused, matching the class-level contract.
+        """
+        try:
+            return Decimal(raw)
+        except (InvalidOperation, TypeError, ValueError):
+            raise ExternalSignerRefused(
+                f"Could not parse {what} ({raw!r}) into a real number; refusing "
+                "rather than defaulting to a zero (vacuous) value that would "
+                "bypass the value gate."
+            )
+
     def _intent_from_tx(self, tx: Transaction) -> PaymentIntent:
         """Build a value-bearing intent from a Payment.
 
         Parses the amount from the canonical XRPL form (``to_xrpl()``), so IOU and
         MPT amounts - which xrpl-py stores as objects, not dicts - are valued
-        correctly rather than falling through to zero. An amount this method
-        cannot turn into a real number, or a missing destination, is refused: it
-        must never be defaulted to a value that makes the risk checks vacuous.
+        correctly rather than falling through to zero. Amounts are parsed
+        directly into :class:`~decimal.Decimal` from XRPL's own precise wire-
+        format strings (never via ``float``), so no binary-rounding artifact can
+        creep into a risk-relevant amount. An amount this method cannot turn into
+        a real number, or a missing destination, is refused: it must never be
+        defaulted to a value that makes the risk checks vacuous.
         """
         xrpl = tx.to_xrpl()
         destination = xrpl.get("Destination")
@@ -199,24 +225,25 @@ class QuorumVaultExternalSigner:
                 "Payment has no Destination; refusing to sign a transfer with no payee."
             )
         amount = xrpl.get("Amount")
-        if isinstance(amount, str):  # XRP, in drops
+        if isinstance(amount, str):  # XRP, in drops - an exact integer string
+            drops = self._parse_decimal(amount, what="XRP drops amount")
             return PaymentIntent(
-                destination=destination, asset="XRP", amount=int(amount) / 1_000_000
+                destination=destination, asset="XRP", amount=drops / Decimal(1_000_000)
             )
         if isinstance(amount, dict) and "value" in amount:
             if "mpt_issuance_id" in amount:
                 mpt_id = str(amount.get("mpt_issuance_id"))
                 rwa = self._resolve_rwa(mpt_id, destination)
+                value = self._parse_decimal(amount["value"], what="MPT amount")
                 return PaymentIntent(
                     destination=destination,
                     asset="MPT:" + mpt_id,
-                    amount=float(amount["value"]),
+                    amount=value,
                     rwa=rwa,
                 )
             asset = amount.get("currency", "?")
-            return PaymentIntent(
-                destination=destination, asset=asset, amount=float(amount["value"])
-            )
+            value = self._parse_decimal(amount["value"], what="IOU amount")
+            return PaymentIntent(destination=destination, asset=asset, amount=value)
         raise ExternalSignerRefused(
             f"Unrecognized Payment Amount shape ({amount!r}); refusing rather than "
             "defaulting to a zero (vacuous) value that would bypass the value gate."
