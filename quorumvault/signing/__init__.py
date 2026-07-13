@@ -11,6 +11,9 @@ Backends:
     secp256k1. This is the minimum acceptable posture near real funds.
   * :class:`AwsKmsSignerBackend` — non-exportable secp256k1 key; the key never
     leaves the HSM/KMS. Reference for the strongest production posture.
+  * :class:`AwsKmsEd25519SignerBackend` — non-exportable ed25519 KMS key
+    (spec ``ECC_NIST_EDWARDS25519``, native to KMS since 2025-11-07), letting
+    the existing ed25519 signers adopt KMS with no curve migration.
 
 :class:`QuorumSigner` combines backends into a multisigned transaction that is
 byte-for-byte identical to xrpl-py's own ``sign(multisign=True)`` + ``multisign``
@@ -41,11 +44,11 @@ __all__ = [
     "BackendConfigError",
 ]
 
-# AwsKmsSignerBackend is imported lazily to avoid a hard boto3 dependency for
-# users who only need the local keystore path.
+# The AWS KMS backends are imported lazily so users who only need the local
+# keystore path never trigger the kms_backend import.
 def __getattr__(name: str):  # pragma: no cover - thin lazy import shim
-    if name == "AwsKmsSignerBackend":
-        from .kms_backend import AwsKmsSignerBackend
+    if name in ("AwsKmsSignerBackend", "AwsKmsEd25519SignerBackend"):
+        from . import kms_backend
 
-        return AwsKmsSignerBackend
+        return getattr(kms_backend, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
