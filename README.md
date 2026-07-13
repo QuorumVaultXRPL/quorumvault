@@ -101,7 +101,8 @@ quorumvault/
 ├── policy/             the risk rules
 │   ├── risk_engine.py   value / whitelist / velocity rules + circuit breaker
 │   ├── pricing.py       injectable RateProvider (no hardcoded exchange rate)
-│   └── rwa_rule.py      RWA compliance rule (MPTs, Credentials, Domains, Clawback)
+│   ├── rwa_rule.py      RWA compliance rule (MPTs, Credentials, Domains, Clawback)
+│   └── treasury_guard.py  live 2-of-2 config guard (no RegularKey, master disabled, SignerList matches)
 ├── tiers/              the v2 assurance lanes
 │   ├── channel_custody.py  Payment-Channel lane (audited at open/close only)
 │   ├── fast_path.py     Velocity-Bounded Fast Path (LastLedgerSequence expiry)
@@ -185,6 +186,7 @@ python testnet_multisig_demo_v2.py --submit
 2. **The encrypted keystore is not an HSM.** It never writes plaintext key material to disk, but it must decrypt into process memory to sign, and Python cannot guarantee that memory is wiped. This is the floor for "near funds," not the ceiling — only a real HSM/KMS (key never leaves the boundary) closes that gap.
 3. **Channel capacity is the audited exposure window.** The Channel-Custody lane is audited only at open and close; the capacity set at open is the bound on what could go wrong between them, and anything larger routes to the quorum instead.
 4. **Value routing depends on a live rate.** Every tier boundary is denominated in RLUSD-equivalent value, so the exchange rate is an injected `RateProvider`, never a hardcoded constant — a stale price would otherwise silently misroute a transaction into a less-audited tier. `StaticRateProvider` is a clearly labelled Testnet placeholder (`is_live == False`); production requires a staleness-guarded `CallableRateProvider` wrapping a live feed.
+5. **Governance transactions are refused *and* the live 2-of-2 is verified before signing.** `QuorumVaultExternalSigner` risk-gates only `Payment`s and refuses every other type — `SignerListSet`, `AccountSet`, `SetRegularKey`, etc. — by an allowlist (`DEFAULT_SIGNABLE_TX_TYPES`), so QuorumVault never *creates* a custody bypass through the payment path (`tests/test_external_signer_adversarial.py`). That refusal is now backed by an explicit runtime guard on the treasury's **live on-ledger state**, not just code-review discipline: an optional injected `TreasuryConfigVerifier` (`policy/treasury_guard.py`) that, before any signature is produced, reads the treasury's `account_info` and refuses unless (a) **no `RegularKey`** is set (an alternate single-key path around the quorum), (b) **`lsfDisableMaster`** (`0x00100000`) is set so the master key cannot sign unilaterally, and (c) the account's **live `SignerList` exactly matches the expected quorum** — same members, same `SignerQuorum`, and no single signer whose weight alone meets quorum. Any read failure or mismatch fails closed (`TreasuryConfigError`). It follows the `RateProvider` / `LedgerComplianceReader` seam pattern: `XrplTreasuryConfigVerifier` (live, `is_live == True`) over any `xrpl-py` client, and `StaticTreasuryConfigVerifier` (labelled placeholder, `is_live == False`) for offline tests/demos. Wiring a live guard is **required for any real (non-demo) treasury**; a signer with no guard wired still operates but emits a `TreasuryGuardNotWiredWarning` rather than silently assuming the account is safe. (Directly addresses the "signer list change / remove / bypass with regular key" scenarios raised in external technical review.)
 
 ---
 
