@@ -7,6 +7,7 @@ freshly generated in-process.
 import pytest
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.utils import (
     Prehashed,
     decode_dss_signature,
@@ -14,6 +15,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import (
 )
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from xrpl.constants import CryptoAlgorithm
+from xrpl.core.keypairs import derive_keypair
 from xrpl.wallet import Wallet
 
 from quorumvault.signing.keystore import EncryptedKeystore
@@ -87,3 +89,55 @@ def fake_kms():
 @pytest.fixture
 def fake_kms_high_s():
     return FakeKms(force_high_s=True)
+
+
+class FakeKmsEd25519:
+    """Stands in for a boto3 KMS client backed by a real ECC_NIST_EDWARDS25519 key.
+
+    Built from an xrpl-py ed25519 keypair so its raw 64-byte signatures are
+    byte-for-byte what xrpl-py itself produces — the whole point of the parity
+    test. ``malform`` forces a wrong-length signature so we can prove the backend
+    fails closed instead of emitting garbage near funds.
+    """
+
+    def __init__(
+        self, xrpl_public_key: str, xrpl_private_key: str, malform: bool = False
+    ):
+        assert xrpl_private_key.startswith("ED")
+        self.xrpl_public_key = xrpl_public_key
+        self.xrpl_private_key = xrpl_private_key
+        self._priv = Ed25519PrivateKey.from_private_bytes(
+            bytes.fromhex(xrpl_private_key[2:])
+        )
+        self.malform = malform
+
+    def get_public_key(self, KeyId):  # noqa: N803 (boto3 casing)
+        der = self._priv.public_key().public_bytes(
+            Encoding.DER, PublicFormat.SubjectPublicKeyInfo
+        )
+        return {"PublicKey": der, "KeySpec": "ECC_NIST_EDWARDS25519"}
+
+    def sign(self, KeyId, Message, MessageType, SigningAlgorithm):  # noqa: N803
+        # QuorumVault's ed25519 path must sign the RAW blob with ED25519_SHA_512.
+        assert MessageType == "RAW"
+        assert SigningAlgorithm == "ED25519_SHA_512"
+        sig = self._priv.sign(Message)  # raw 64-byte R||S
+        if self.malform:
+            sig = sig[:-1]  # 63 bytes: wrong length, must be rejected
+        return {"Signature": sig}
+
+
+def _fresh_ed25519_kms(malform: bool = False) -> FakeKmsEd25519:
+    wallet = Wallet.create(CryptoAlgorithm.ED25519)
+    public_key, private_key = derive_keypair(wallet.seed)
+    return FakeKmsEd25519(public_key, private_key, malform=malform)
+
+
+@pytest.fixture
+def fake_kms_ed25519():
+    return _fresh_ed25519_kms()
+
+
+@pytest.fixture
+def fake_kms_ed25519_malformed():
+    return _fresh_ed25519_kms(malform=True)
