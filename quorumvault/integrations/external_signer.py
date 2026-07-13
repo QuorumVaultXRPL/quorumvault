@@ -34,6 +34,17 @@ Likewise, an amount this signer cannot parse into a real number is refused, neve
 defaulted to zero (a zero amount would make the value threshold structurally
 unable to fire and route to the least-scrutinized lane).
 
+LIVE TREASURY-CONFIG GUARD (optional, but required for real treasuries).
+Refusing governance transactions stops QuorumVault from *creating* a bypass, but
+not one created out of band. An optional injected
+:class:`~quorumvault.policy.treasury_guard.TreasuryConfigVerifier` closes that:
+before any signature is produced it confirms the treasury's live on-ledger state
+still makes the 2-of-2 the only authorization path - no ``RegularKey``, master
+key disabled (``lsfDisableMaster``), and a ``SignerList`` that exactly matches the
+expected signers and quorum. Following the same precedent as the RWA compliance
+reader, a missing guard is not silently treated as safe: signing without one
+emits a ``TreasuryGuardNotWiredWarning``.
+
 Amounts are parsed straight into :class:`~decimal.Decimal` from XRPL's own wire
 format (the drops string for XRP, the ``"value"`` decimal string for IOU/MPT) —
 never routed through ``float`` at all. See :mod:`quorumvault.policy.money` for
@@ -43,6 +54,7 @@ codebase; a value the network itself sends as an exact string should stay exact.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import FrozenSet, Iterable, List, Optional
@@ -52,6 +64,11 @@ from xrpl.models.transactions.transaction import Transaction
 
 from ..policy.intent import PaymentIntent
 from ..policy.risk_engine import RiskEngine, RiskLevel
+from ..policy.treasury_guard import (
+    TreasuryConfigError,
+    TreasuryConfigVerifier,
+    TreasuryGuardNotWiredWarning,
+)
 from ..signing.quorum_signer import QuorumSigner
 from ..tiers.router import TierRouter
 
@@ -99,11 +116,24 @@ class QuorumVaultExternalSigner:
         compliance_reader=None,
         rwa_required_credentials=None,
         rwa_domain_id: Optional[str] = None,
+        treasury_guard: Optional[TreasuryConfigVerifier] = None,
+        expected_signers: Optional[Iterable[str]] = None,
+        expected_signer_quorum: Optional[int] = None,
     ):
         self._address = treasury_address
         self._quorum = quorum_signer
         self._risk = risk_engine
         self._router = router
+        # Live treasury-config guard: optional injected dependency, same
+        # precedent as compliance_reader. When wired, sign() verifies the
+        # treasury's live on-ledger 2-of-2 config before co-signing; when
+        # absent, sign() still works but emits TreasuryGuardNotWiredWarning
+        # (never a silent 'assume safe'). Required for any real treasury.
+        self._treasury_guard = treasury_guard
+        self._expected_signers = (
+            set(expected_signers) if expected_signers is not None else None
+        )
+        self._expected_signer_quorum = expected_signer_quorum
         # RWA compliance path. If an MPT transfer arrives and no reader is wired,
         # the signer refuses rather than signing an RWA transfer with no
         # compliance check (a deliberate control, not a caller's memory).
@@ -126,7 +156,8 @@ class QuorumVaultExternalSigner:
         """Risk-gate, then 2-of-2 multisign. Returns ``{tx_blob, hash}``.
 
         Raises :class:`ExternalSignerRefused` on an unsupported transaction type,
-        an un-valuable transaction, or any non-GREEN Auditor verdict.
+        an un-valuable transaction, any non-GREEN Auditor verdict, or a live
+        treasury-config guard violation.
         """
         tx_type = getattr(tx.transaction_type, "value", str(tx.transaction_type))
 
@@ -160,6 +191,11 @@ class QuorumVaultExternalSigner:
                 f"{verdict['risk_level'].value} "
                 f"({', '.join(verdict['fired_reasons']) or 'policy violation'})."
             )
+        # Final gate before a signature exists: confirm the treasury's live
+        # on-ledger config still makes the 2-of-2 the only way to move funds
+        # (no RegularKey, master key disabled, SignerList == expected quorum).
+        # Directly answers Wietse Wind's signer-list / regular-key bypass point.
+        self._verify_treasury_config()
         signed = self._quorum.multisign(tx)
         return {"tx_blob": encode(signed.to_xrpl()), "hash": signed.get_hash()}
 
@@ -168,6 +204,57 @@ class QuorumVaultExternalSigner:
     def signers_count(self) -> int:
         """How many signatures this signer contributes (multisig fee sizing)."""
         return len(self._quorum.signer_addresses)
+
+    def _verify_treasury_config(self) -> None:
+        """Verify the treasury's live 2-of-2 config, or refuse.
+
+        Optional injected guard (same precedent as the RWA compliance reader).
+        With a guard wired, a config violation (RegularKey set, master key still
+        enabled, or a SignerList that no longer matches the expected quorum)
+        raises :class:`ExternalSignerRefused` and no signature is produced. With
+        no guard wired the signer still operates but emits a
+        :class:`~quorumvault.policy.treasury_guard.TreasuryGuardNotWiredWarning`:
+        never a silent 'assume safe'. A live guard is required for any real
+        (non-demo) treasury.
+        """
+        expected_signers = (
+            self._expected_signers
+            if self._expected_signers is not None
+            else set(self._quorum.signer_addresses)
+        )
+        expected_quorum = (
+            self._expected_signer_quorum
+            if self._expected_signer_quorum is not None
+            else len(self._quorum.signer_addresses)
+        )
+        if self._treasury_guard is None:
+            warnings.warn(
+                TreasuryGuardNotWiredWarning(
+                    "QuorumVaultExternalSigner produced a signature with no "
+                    "treasury_guard wired: the treasury's live on-ledger config "
+                    "(RegularKey / lsfDisableMaster / SignerList) was NOT "
+                    "verified. Wire an XrplTreasuryConfigVerifier for any real "
+                    "treasury."
+                ),
+                stacklevel=3,
+            )
+            return
+        try:
+            self._treasury_guard.verify(
+                treasury_address=self._address,
+                expected_signers=expected_signers,
+                expected_quorum=expected_quorum,
+            )
+        except TreasuryConfigError as exc:
+            self.last_decision = SignDecision(
+                tier="refused",
+                risk_level="REFUSED",
+                fired_reasons=[f"treasury_config_violation:{exc}"],
+            )
+            raise ExternalSignerRefused(
+                "QuorumVault refused: the treasury's live config guard blocked "
+                f"signing. {exc}"
+            ) from exc
 
     def _resolve_rwa(self, mpt_issuance_id: str, destination: str):
         """Resolve RWA compliance context for an MPT transfer, or refuse.
