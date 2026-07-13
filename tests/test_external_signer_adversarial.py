@@ -8,7 +8,8 @@ GREEN / a real signature for something that must be refused.
 
 import pytest
 from xrpl.models.amounts import IssuedCurrencyAmount, MPTAmount
-from xrpl.models.transactions import AccountSet, Payment, SignerListSet
+from xrpl.models.response import Response, ResponseStatus, ResponseType
+from xrpl.models.transactions import AccountSet, Payment, SetRegularKey, SignerListSet
 from xrpl.models.transactions.signer_list_set import SignerEntry
 
 from quorumvault.integrations.external_signer import (
@@ -17,6 +18,12 @@ from quorumvault.integrations.external_signer import (
 )
 from quorumvault.policy.intent import Credential, RwaTransfer
 from quorumvault.policy.ledger_reader import StaticComplianceReader
+from quorumvault.policy.treasury_guard import (
+    LSF_DISABLE_MASTER,
+    StaticTreasuryConfigVerifier,
+    TreasuryGuardNotWiredWarning,
+    XrplTreasuryConfigVerifier,
+)
 from quorumvault.policy.risk_engine import RiskEngine
 from quorumvault.signing.local_keystore import LocalEncryptedKeystoreBackend
 from quorumvault.signing.quorum_signer import QuorumSigner
@@ -28,7 +35,7 @@ OTHER = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
 ISSUANCE = "000004C463C52827307480341125DA0577DEFC38405B0E3E"
 
 
-def _signer(keystore, passphrase, *, whitelist=(DEST,), reader=None, req_creds=None, domain=None):
+def _signer(keystore, passphrase, *, whitelist=(DEST,), reader=None, req_creds=None, domain=None, guard=None):
     backends = [
         LocalEncryptedKeystoreBackend(keystore, "exec_signer", passphrase),
         LocalEncryptedKeystoreBackend(keystore, "auditor_signer", passphrase),
@@ -41,6 +48,7 @@ def _signer(keystore, passphrase, *, whitelist=(DEST,), reader=None, req_creds=N
         compliance_reader=reader,
         rwa_required_credentials=req_creds,
         rwa_domain_id=domain,
+        treasury_guard=guard,
     )
 
 
@@ -155,3 +163,96 @@ def test_payment_without_destination_refused(keystore, passphrase):
     signer = _signer(keystore, passphrase)
     with pytest.raises(ExternalSignerRefused):
         signer.sign(_StubTx())
+
+
+# -- SetRegularKey is refused explicitly (Wietse: "bypass with regular key") -
+
+
+def test_refuses_setregularkey(keystore, passphrase):
+    signer = _signer(keystore, passphrase, whitelist=(DEST, TREASURY))
+    with pytest.raises(ExternalSignerRefused):
+        signer.sign(SetRegularKey(account=TREASURY, regular_key=OTHER))
+    assert (
+        "unsupported_transaction_type:SetRegularKey"
+        in signer.last_decision.fired_reasons
+    )
+
+
+def test_refuses_setregularkey_removal(keystore, passphrase):
+    # Even *removing* a regular key (regular_key omitted) is not the payment path's
+    # job; it is a governance change that must be authorized out of band.
+    signer = _signer(keystore, passphrase, whitelist=(DEST, TREASURY))
+    with pytest.raises(ExternalSignerRefused):
+        signer.sign(SetRegularKey(account=TREASURY))
+    assert signer.last_decision.risk_level == "REFUSED"
+
+
+# -- live treasury-config guard vetoes a would-be-GREEN payment -------------
+
+
+def _green_payment():
+    return Payment(
+        account=TREASURY, amount="1000000", destination=DEST,
+        sequence=1, fee="20", last_ledger_sequence=100_000, signing_pub_key="",
+    )
+
+
+def test_treasury_guard_blocks_green_payment_when_config_tampered(keystore, passphrase):
+    # The Auditor would say GREEN, but the live-config guard vetoes: no signature.
+    signer = _signer(
+        keystore, passphrase, whitelist=(DEST,),
+        guard=StaticTreasuryConfigVerifier(ok=False, reason="signer list changed"),
+    )
+    with pytest.raises(ExternalSignerRefused) as exc:
+        signer.sign(_green_payment())
+    assert "config guard blocked" in str(exc.value)
+    assert signer.last_decision.risk_level == "REFUSED"
+    assert any(
+        "treasury_config_violation" in r for r in signer.last_decision.fired_reasons
+    )
+
+
+def test_treasury_guard_allows_green_payment_when_config_ok(keystore, passphrase, recwarn):
+    signer = _signer(
+        keystore, passphrase, whitelist=(DEST,),
+        guard=StaticTreasuryConfigVerifier(ok=True),
+    )
+    out = signer.sign(_green_payment())
+    assert set(out) == {"tx_blob", "hash"}
+    assert signer.last_decision.risk_level == "GREEN"
+    # A wired guard means the 'not wired' warning is NOT emitted.
+    assert not any(
+        issubclass(w.category, TreasuryGuardNotWiredWarning) for w in recwarn.list
+    )
+
+
+class _FakeAcctInfoClient:
+    """Minimal xrpl-py-style client for one account_info call in a wiring test."""
+
+    def __init__(self, result):
+        self._result = result
+
+    def request(self, request):
+        return Response(
+            status=ResponseStatus.SUCCESS, result=self._result, type=ResponseType.RESPONSE
+        )
+
+
+def test_live_guard_regular_key_blocks_green_payment(keystore, passphrase):
+    # End to end: a live XrplTreasuryConfigVerifier over a fake account_info that
+    # reports a RegularKey on the treasury -> a GREEN payment is refused.
+    result = {
+        "account_data": {
+            "Account": TREASURY,
+            "Flags": LSF_DISABLE_MASTER,
+            "RegularKey": OTHER,
+        },
+        "signer_lists": [],
+    }
+    signer = _signer(
+        keystore, passphrase, whitelist=(DEST,),
+        guard=XrplTreasuryConfigVerifier(_FakeAcctInfoClient(result)),
+    )
+    with pytest.raises(ExternalSignerRefused) as exc:
+        signer.sign(_green_payment())
+    assert "RegularKey" in str(exc.value)
