@@ -16,6 +16,13 @@ from .pricing import (
 )
 from .risk_engine import RiskEngine, RiskLevel
 from .rwa_rule import RwaComplianceRule, RwaFinding
+from .treasury_guard import (
+    StaticTreasuryConfigVerifier,
+    TreasuryConfigError,
+    TreasuryConfigVerifier,
+    TreasuryGuardNotWiredWarning,
+    XrplTreasuryConfigVerifier,
+)
 
 __all__ = [
     "Credential",
@@ -34,4 +41,9 @@ __all__ = [
     "XrplLedgerComplianceReader",
     "StaticComplianceReader",
     "ComplianceReadError",
+    "TreasuryConfigVerifier",
+    "XrplTreasuryConfigVerifier",
+    "StaticTreasuryConfigVerifier",
+    "TreasuryConfigError",
+    "TreasuryGuardNotWiredWarning",
 ]
