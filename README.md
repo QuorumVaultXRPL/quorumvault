@@ -96,7 +96,7 @@ quorumvault/
 │   ├── backend.py       SignerBackend — the interface everything else depends on
 │   ├── keystore.py      AES-256-GCM + scrypt encrypted keystore, no plaintext at rest
 │   ├── local_keystore.py  LocalEncryptedKeystoreBackend (ed25519 or secp256k1)
-│   ├── kms_backend.py   AwsKmsSignerBackend (non-exportable secp256k1)
+│   ├── kms_backend.py   AwsKmsSignerBackend (secp256k1) + AwsKmsEd25519SignerBackend (ed25519) — both non-exportable
 │   └── quorum_signer.py QuorumSigner — combines backends into one multisigned tx
 ├── policy/             the risk rules
 │   ├── risk_engine.py   value / whitelist / velocity rules + circuit breaker
@@ -134,7 +134,7 @@ class SignerBackend(ABC):
     def sign(self, signing_blob: bytes) -> str: ...   # -> TxnSignature hex
 ```
 
-`QuorumSigner([backend_a, backend_b]).multisign(tx)` produces a transaction that is **byte-for-byte identical** to xrpl-py's own `sign(multisign=True)` + `multisign()` — asserted directly in `tests/test_quorum_signer.py`. Swapping keystore ↔ HSM/KMS is invisible above this line. `tests/test_mixed_backend_quorum.py` proves a single quorum can mix an ed25519 local-keystore signer with a secp256k1 KMS signer with no change to the quorum logic itself.
+`QuorumSigner([backend_a, backend_b]).multisign(tx)` produces a transaction that is **byte-for-byte identical** to xrpl-py's own `sign(multisign=True)` + `multisign()` — asserted directly in `tests/test_quorum_signer.py`. Swapping keystore ↔ HSM/KMS is invisible above this line. `tests/test_mixed_backend_quorum.py` proves a single quorum can freely mix backends and schemes — an ed25519 local-keystore signer, a secp256k1 KMS signer, and a non-exportable ed25519 KMS signer together — with no change to the quorum logic itself.
 
 ---
 
@@ -181,7 +181,7 @@ python testnet_multisig_demo_v2.py --submit
 
 ## Security tradeoffs (flagged, not hidden)
 
-1. **ed25519 vs. cloud HSM/KMS.** AWS/GCP KMS can only sign **secp256k1**, not ed25519 — today's Testnet signers are ed25519. The local encrypted keystore works with them today, no migration required; moving a signer to `AwsKmsSignerBackend` means adding a secp256k1 key to the treasury's `SignerListSet` one signer at a time (or using an ed25519-capable backend such as HashiCorp Vault, same interface).
+1. **ed25519 and cloud HSM/KMS.** *(Corrected 2025-11-07.)* AWS KMS **now signs ed25519 natively** — key spec `ECC_NIST_EDWARDS25519`, signing algorithm `ED25519_SHA_512` with `MessageType="RAW"` — [announced Nov 7, 2025](https://aws.amazon.com/about-aws/whats-new/2025/11/aws-kms-edwards-curve-digital-signature-algorithm/) and available in all AWS Regions ([KMS key spec reference](https://docs.aws.amazon.com/kms/latest/developerguide/symm-asymm-choose-key-spec.html)). So today's ed25519 Testnet signers can move to a **non-exportable KMS-backed key with no curve migration and no `SignerListSet` change** — use `AwsKmsEd25519SignerBackend`, the ed25519 sibling of the original secp256k1 `AwsKmsSignerBackend`. That is a materially better production path than the earlier "migrate a signer to secp256k1 first, one at a time" route, which is no longer necessary; the secp256k1 KMS path still works unchanged if ever wanted. **GCP KMS** was not re-verified for this change — check Google Cloud KMS's current signing-algorithm list directly before assuming ed25519 support either way. HashiCorp Vault's `transit` engine remains an ed25519-capable alternative behind the same `SignerBackend` interface.
 2. **The encrypted keystore is not an HSM.** It never writes plaintext key material to disk, but it must decrypt into process memory to sign, and Python cannot guarantee that memory is wiped. This is the floor for "near funds," not the ceiling — only a real HSM/KMS (key never leaves the boundary) closes that gap.
 3. **Channel capacity is the audited exposure window.** The Channel-Custody lane is audited only at open and close; the capacity set at open is the bound on what could go wrong between them, and anything larger routes to the quorum instead.
 4. **Value routing depends on a live rate.** Every tier boundary is denominated in RLUSD-equivalent value, so the exchange rate is an injected `RateProvider`, never a hardcoded constant — a stale price would otherwise silently misroute a transaction into a less-audited tier. `StaticRateProvider` is a clearly labelled Testnet placeholder (`is_live == False`); production requires a staleness-guarded `CallableRateProvider` wrapping a live feed.
@@ -195,7 +195,7 @@ python testnet_multisig_demo_v2.py --submit
 - [x] AES-256-GCM + scrypt encrypted keystore — no plaintext key material at rest or in logs
 - [x] Tiered routing: Channel-Custody lane, Velocity-Bounded Fast Path, 2-of-2 quorum backstop
 - [x] RWA compliance rule (MPTs, Credentials, Permissioned Domains, Clawback)
-- [ ] Live AWS KMS run against a real secp256k1 signer (current KMS backend is tested against a mock)
+- [ ] Live AWS KMS run against a real non-exportable signer (ed25519 — no secp256k1 migration — or secp256k1; current KMS backends are tested against a mock)
 - [x] RWA rule wired to live ledger reads (XrplLedgerComplianceReader is written and tested against a fake client; not yet run against a real server)
 - [ ] SSO + hardware MFA (FIDO2/WebAuthn) for human overrides, replacing the current bare-token model
 - [ ] Independent security audit — required before any of this touches Mainnet or real funds
