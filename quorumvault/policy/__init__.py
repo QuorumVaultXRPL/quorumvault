@@ -1,5 +1,12 @@
 """Risk policy: the ported v1 rules plus the v2 RWA compliance rule."""
 
+from .agent_identity import (
+    AgentIdentityError,
+    AgentIdentityNotWiredWarning,
+    AgentIdentityVerifier,
+    StaticAgentIdentityVerifier,
+    XrplAgentIdentityVerifier,
+)
 from .intent import Credential, PaymentIntent, RwaTransfer
 from .ledger_reader import (
     ComplianceReadError,
@@ -46,4 +53,9 @@ __all__ = [
     "StaticTreasuryConfigVerifier",
     "TreasuryConfigError",
     "TreasuryGuardNotWiredWarning",
+    "AgentIdentityVerifier",
+    "XrplAgentIdentityVerifier",
+    "StaticAgentIdentityVerifier",
+    "AgentIdentityError",
+    "AgentIdentityNotWiredWarning",
 ]
