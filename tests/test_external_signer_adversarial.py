@@ -17,6 +17,13 @@ from quorumvault.integrations.external_signer import (
     QuorumVaultExternalSigner,
 )
 from quorumvault.policy.intent import Credential, RwaTransfer
+from quorumvault.policy.agent_identity import (
+    LSF_CREDENTIAL_ACCEPTED,
+    AgentIdentityNotWiredWarning,
+    StaticAgentIdentityVerifier,
+    XrplAgentIdentityVerifier,
+    normalize_credential_type,
+)
 from quorumvault.policy.ledger_reader import StaticComplianceReader
 from quorumvault.policy.treasury_guard import (
     LSF_DISABLE_MASTER,
@@ -35,7 +42,10 @@ OTHER = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
 ISSUANCE = "000004C463C52827307480341125DA0577DEFC38405B0E3E"
 
 
-def _signer(keystore, passphrase, *, whitelist=(DEST,), reader=None, req_creds=None, domain=None, guard=None):
+def _signer(
+    keystore, passphrase, *, whitelist=(DEST,), reader=None, req_creds=None,
+    domain=None, guard=None, identity=None, issuers=(), cred_type=None,
+):
     backends = [
         LocalEncryptedKeystoreBackend(keystore, "exec_signer", passphrase),
         LocalEncryptedKeystoreBackend(keystore, "auditor_signer", passphrase),
@@ -49,6 +59,9 @@ def _signer(keystore, passphrase, *, whitelist=(DEST,), reader=None, req_creds=N
         rwa_required_credentials=req_creds,
         rwa_domain_id=domain,
         treasury_guard=guard,
+        agent_identity_verifier=identity,
+        recognized_credential_issuers=issuers,
+        required_credential_type=cred_type,
     )
 
 
@@ -256,3 +269,105 @@ def test_live_guard_regular_key_blocks_green_payment(keystore, passphrase):
     with pytest.raises(ExternalSignerRefused) as exc:
         signer.sign(_green_payment())
     assert "RegularKey" in str(exc.value)
+
+
+# -- agent identity: "is this agent legitimate / who controls it" ------------
+
+AGENT_CRED_TYPE = "AGENT_OPERATOR"
+TRUSTED_ISSUER = "ra5nK24KXen9AHvsdFTKHSANinZseWnPcX"
+UNTRUSTED_ISSUER = "rsA2LpzuawewSBQXkiju3YQTMzW13pAAdW"
+
+
+class _FakeCredClient:
+    """xrpl-py-style client returning one credential page for account_objects.
+
+    Echoes the requested account back as Subject so it works for whichever
+    signer address the ExternalSigner asks about.
+    """
+
+    def __init__(self, *, issuer, accepted=True, cred_type=None):
+        self._issuer = issuer
+        self._accepted = accepted
+        self._type = cred_type or normalize_credential_type(AGENT_CRED_TYPE)
+
+    def request(self, request):
+        subject = getattr(request, "account")
+        obj = {
+            "LedgerEntryType": "Credential",
+            "Subject": subject,
+            "Issuer": self._issuer,
+            "CredentialType": self._type,
+            "Flags": LSF_CREDENTIAL_ACCEPTED if self._accepted else 0,
+        }
+        return Response(
+            status=ResponseStatus.SUCCESS,
+            result={"account_objects": [obj]},
+            type=ResponseType.RESPONSE,
+        )
+
+
+def test_refuses_green_payment_when_agent_identity_unverified(keystore, passphrase):
+    signer = _signer(
+        keystore, passphrase, whitelist=(DEST,),
+        identity=StaticAgentIdentityVerifier(ok=False, reason="unaccredited agent"),
+    )
+    with pytest.raises(ExternalSignerRefused) as exc:
+        signer.sign(_green_payment())
+    assert "agent identity could not be verified" in str(exc.value)
+    assert signer.last_decision.risk_level == "REFUSED"
+    assert any(
+        "agent_identity_unverified" in r for r in signer.last_decision.fired_reasons
+    )
+
+
+def test_signs_green_payment_when_agent_identity_verified(keystore, passphrase, recwarn):
+    signer = _signer(
+        keystore, passphrase, whitelist=(DEST,),
+        identity=StaticAgentIdentityVerifier(ok=True),
+    )
+    out = signer.sign(_green_payment())
+    assert set(out) == {"tx_blob", "hash"}
+    assert signer.last_decision.risk_level == "GREEN"
+    # A wired verifier means the 'not wired' warning is NOT emitted.
+    assert not any(
+        issubclass(w.category, AgentIdentityNotWiredWarning) for w in recwarn.list
+    )
+
+
+def test_live_identity_verifier_accepts_recognized_issuer(keystore, passphrase):
+    signer = _signer(
+        keystore, passphrase, whitelist=(DEST,),
+        identity=XrplAgentIdentityVerifier(_FakeCredClient(issuer=TRUSTED_ISSUER)),
+        issuers=(TRUSTED_ISSUER,),
+        cred_type=AGENT_CRED_TYPE,
+    )
+    out = signer.sign(_green_payment())
+    assert set(out) == {"tx_blob", "hash"}
+
+
+def test_live_identity_verifier_refuses_untrusted_issuer(keystore, passphrase):
+    # End to end: the agents hold a credential of the right type, but from an
+    # issuer this treasury does not recognize -> no signature.
+    signer = _signer(
+        keystore, passphrase, whitelist=(DEST,),
+        identity=XrplAgentIdentityVerifier(_FakeCredClient(issuer=UNTRUSTED_ISSUER)),
+        issuers=(TRUSTED_ISSUER,),
+        cred_type=AGENT_CRED_TYPE,
+    )
+    with pytest.raises(ExternalSignerRefused) as exc:
+        signer.sign(_green_payment())
+    assert "recognized-issuer set" in str(exc.value)
+
+
+def test_live_identity_verifier_refuses_unaccepted_credential(keystore, passphrase):
+    signer = _signer(
+        keystore, passphrase, whitelist=(DEST,),
+        identity=XrplAgentIdentityVerifier(
+            _FakeCredClient(issuer=TRUSTED_ISSUER, accepted=False)
+        ),
+        issuers=(TRUSTED_ISSUER,),
+        cred_type=AGENT_CRED_TYPE,
+    )
+    with pytest.raises(ExternalSignerRefused) as exc:
+        signer.sign(_green_payment())
+    assert "NOT accepted" in str(exc.value)
