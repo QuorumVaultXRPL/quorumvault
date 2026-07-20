@@ -45,6 +45,17 @@ expected signers and quorum. Following the same precedent as the RWA compliance
 reader, a missing guard is not silently treated as safe: signing without one
 emits a ``TreasuryGuardNotWiredWarning``.
 
+AGENT IDENTITY (optional, but required for any identity-aware deployment).
+The treasury guard answers "is custody intact"; it does not answer "is this
+agent legitimate" or "who controls it". An optional injected
+:class:`~quorumvault.policy.agent_identity.AgentIdentityVerifier` closes that:
+before any signature is produced it confirms each signing agent's account is
+the subject of a live, accepted, unexpired XLS-70 Credential issued by an
+issuer the treasury operator recognizes. Recognized issuers and the required
+credential type are always caller-supplied; QuorumVault consumes credentials
+and never issues them. Absent verifier is not silently treated as verified: it
+emits an ``AgentIdentityNotWiredWarning``.
+
 Amounts are parsed straight into :class:`~decimal.Decimal` from XRPL's own wire
 format (the drops string for XRP, the ``"value"`` decimal string for IOU/MPT) —
 never routed through ``float`` at all. See :mod:`quorumvault.policy.money` for
@@ -62,6 +73,11 @@ from typing import FrozenSet, Iterable, List, Optional
 from xrpl.core.binarycodec import encode
 from xrpl.models.transactions.transaction import Transaction
 
+from ..policy.agent_identity import (
+    AgentIdentityError,
+    AgentIdentityNotWiredWarning,
+    AgentIdentityVerifier,
+)
 from ..policy.intent import PaymentIntent
 from ..policy.risk_engine import RiskEngine, RiskLevel
 from ..policy.treasury_guard import (
@@ -119,6 +135,10 @@ class QuorumVaultExternalSigner:
         treasury_guard: Optional[TreasuryConfigVerifier] = None,
         expected_signers: Optional[Iterable[str]] = None,
         expected_signer_quorum: Optional[int] = None,
+        agent_identity_verifier: Optional[AgentIdentityVerifier] = None,
+        recognized_credential_issuers: Optional[Iterable[str]] = None,
+        required_credential_type: Optional[str] = None,
+        identity_subjects: Optional[Iterable[str]] = None,
     ):
         self._address = treasury_address
         self._quorum = quorum_signer
@@ -134,6 +154,19 @@ class QuorumVaultExternalSigner:
             set(expected_signers) if expected_signers is not None else None
         )
         self._expected_signer_quorum = expected_signer_quorum
+        # Agent-identity verification - the "is this agent legitimate / who
+        # controls it" question the treasury guard does not answer. Optional
+        # injected dependency, same precedent as treasury_guard. Recognized
+        # issuers and the required credential type are ALWAYS caller-supplied:
+        # QuorumVault ships no trusted-issuer list and issues no credentials.
+        # Defaults to verifying every signer account in the quorum (the agents
+        # themselves); point it elsewhere with identity_subjects.
+        self._agent_identity_verifier = agent_identity_verifier
+        self._recognized_credential_issuers = list(recognized_credential_issuers or [])
+        self._required_credential_type = required_credential_type
+        self._identity_subjects = (
+            set(identity_subjects) if identity_subjects is not None else None
+        )
         # RWA compliance path. If an MPT transfer arrives and no reader is wired,
         # the signer refuses rather than signing an RWA transfer with no
         # compliance check (a deliberate control, not a caller's memory).
@@ -156,8 +189,8 @@ class QuorumVaultExternalSigner:
         """Risk-gate, then 2-of-2 multisign. Returns ``{tx_blob, hash}``.
 
         Raises :class:`ExternalSignerRefused` on an unsupported transaction type,
-        an un-valuable transaction, any non-GREEN Auditor verdict, or a live
-        treasury-config guard violation.
+        an un-valuable transaction, any non-GREEN Auditor verdict, a live
+        treasury-config guard violation, or an unverified agent identity.
         """
         tx_type = getattr(tx.transaction_type, "value", str(tx.transaction_type))
 
@@ -196,6 +229,9 @@ class QuorumVaultExternalSigner:
         # (no RegularKey, master key disabled, SignerList == expected quorum).
         # Directly answers Wietse Wind's signer-list / regular-key bypass point.
         self._verify_treasury_config()
+        # ...and confirm the agents themselves are who they claim to be: a
+        # live, accepted, unexpired XLS-70 credential from a recognized issuer.
+        self._verify_agent_identity()
         signed = self._quorum.multisign(tx)
         return {"tx_blob": encode(signed.to_xrpl()), "hash": signed.get_hash()}
 
@@ -255,6 +291,52 @@ class QuorumVaultExternalSigner:
                 "QuorumVault refused: the treasury's live config guard blocked "
                 f"signing. {exc}"
             ) from exc
+
+    def _verify_agent_identity(self) -> None:
+        """Verify each signing agent holds a recognized identity credential, or refuse.
+
+        Answers the two questions the risk engine and treasury guard do not:
+        *is this agent legitimate* and *who controls it*. Optional injected
+        verifier, same precedent as ``treasury_guard``. Every subject must pass:
+        in a 2-of-2, one unaccredited agent invalidates the quorum's legitimacy
+        claim, so a single failure refuses the whole signature. With no verifier
+        wired the signer still operates but emits an
+        :class:`~quorumvault.policy.agent_identity.AgentIdentityNotWiredWarning`:
+        never a silent 'assume legitimate'.
+        """
+        subjects = (
+            self._identity_subjects
+            if self._identity_subjects is not None
+            else set(self._quorum.signer_addresses)
+        )
+        if self._agent_identity_verifier is None:
+            warnings.warn(
+                AgentIdentityNotWiredWarning(
+                    "QuorumVaultExternalSigner produced a signature with no "
+                    "agent_identity_verifier wired: the signing agents' identity "
+                    "credentials were NOT verified. Wire an "
+                    "XrplAgentIdentityVerifier for any identity-aware deployment."
+                ),
+                stacklevel=3,
+            )
+            return
+        for subject in sorted(subjects):
+            try:
+                self._agent_identity_verifier.verify(
+                    signer_address=subject,
+                    recognized_issuers=self._recognized_credential_issuers,
+                    required_credential_type=self._required_credential_type or "",
+                )
+            except AgentIdentityError as exc:
+                self.last_decision = SignDecision(
+                    tier="refused",
+                    risk_level="REFUSED",
+                    fired_reasons=[f"agent_identity_unverified:{exc}"],
+                )
+                raise ExternalSignerRefused(
+                    "QuorumVault refused: signing agent identity could not be "
+                    f"verified. {exc}"
+                ) from exc
 
     def _resolve_rwa(self, mpt_issuance_id: str, destination: str):
         """Resolve RWA compliance context for an MPT transfer, or refuse.
