@@ -201,7 +201,7 @@ python testnet_multisig_demo_v2.py --submit
 - [x] Tiered routing: Channel-Custody lane, Velocity-Bounded Fast Path, 2-of-2 quorum backstop
 - [x] RWA compliance rule (MPTs, Credentials, Permissioned Domains, Clawback)
 - [ ] Live AWS KMS run against a real non-exportable signer (ed25519 — no secp256k1 migration — or secp256k1; current KMS backends are tested against a mock)
-- [x] RWA rule wired to live ledger reads (XrplLedgerComplianceReader is written and tested against a fake client; not yet run against a real server)
+- [x] RWA rule wired to live ledger reads, run against a real server, both live-tested paths: the MPT issuance/authorization path (2026-07-10, `mpt_rwa_demo.py` — a real MPT issuance, one compliant payment and one live-refused payment, both real tx) and the Credential/Permissioned-Domain path (2026-07-22, `credential_domain_rwa_demo.py` — a real issued+accepted XLS-70 Credential and a real Permissioned Domain, resolved live against a holder and a non-holder, cross-checked against independent raw ledger reads)
 - [ ] SSO + hardware MFA (FIDO2/WebAuthn) for human overrides, replacing the current bare-token model
 - [ ] Independent security audit — required before any of this touches Mainnet or real funds
 
