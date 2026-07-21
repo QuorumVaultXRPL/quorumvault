@@ -17,6 +17,11 @@ from quorumvault.integrations.external_signer import (
     QuorumVaultExternalSigner,
 )
 from quorumvault.policy.intent import Credential, RwaTransfer
+from quorumvault.integrations.alerts import (
+    AlertDeliveryFailedWarning,
+    NullAlertSink,
+    RefusalAlertSink,
+)
 from quorumvault.policy.agent_identity import (
     LSF_CREDENTIAL_ACCEPTED,
     AgentIdentityNotWiredWarning,
@@ -45,6 +50,7 @@ ISSUANCE = "000004C463C52827307480341125DA0577DEFC38405B0E3E"
 def _signer(
     keystore, passphrase, *, whitelist=(DEST,), reader=None, req_creds=None,
     domain=None, guard=None, identity=None, issuers=(), cred_type=None,
+    alert_sink=None,
 ):
     backends = [
         LocalEncryptedKeystoreBackend(keystore, "exec_signer", passphrase),
@@ -62,6 +68,7 @@ def _signer(
         agent_identity_verifier=identity,
         recognized_credential_issuers=issuers,
         required_credential_type=cred_type,
+        alert_sink=alert_sink,
     )
 
 
@@ -371,3 +378,47 @@ def test_live_identity_verifier_refuses_unaccepted_credential(keystore, passphra
     with pytest.raises(ExternalSignerRefused) as exc:
         signer.sign(_green_payment())
     assert "NOT accepted" in str(exc.value)
+
+
+# -- refusal alerting: observational, never changes the refusal --------------
+
+
+class _RecordingSink(RefusalAlertSink):
+    def __init__(self):
+        self.calls = []
+
+    def notify(self, decision, *, tx_type):
+        self.calls.append((decision, tx_type))
+
+    @property
+    def is_live(self):
+        return True
+
+
+class _RaisingSink(RefusalAlertSink):
+    def notify(self, decision, *, tx_type):
+        raise RuntimeError("alert channel down")
+
+
+def test_alert_sink_fires_on_refusal(keystore, passphrase):
+    sink = _RecordingSink()
+    signer = _signer(keystore, passphrase, whitelist=(DEST, TREASURY), alert_sink=sink)
+    with pytest.raises(ExternalSignerRefused):
+        signer.sign(_signerlistset())
+    assert len(sink.calls) == 1
+    decision, tx_type = sink.calls[0]
+    assert tx_type == "SignerListSet"
+    assert "unsupported_transaction_type:SignerListSet" in decision.fired_reasons
+
+
+def test_alert_delivery_failure_never_changes_refusal(keystore, passphrase):
+    signer = _signer(keystore, passphrase, whitelist=(DEST, TREASURY), alert_sink=_RaisingSink())
+    with pytest.warns(AlertDeliveryFailedWarning):
+        with pytest.raises(ExternalSignerRefused):
+            signer.sign(_signerlistset())
+
+
+def test_null_alert_sink_is_inert_on_refusal(keystore, passphrase):
+    signer = _signer(keystore, passphrase, whitelist=(DEST, TREASURY), alert_sink=NullAlertSink())
+    with pytest.raises(ExternalSignerRefused):
+        signer.sign(_signerlistset())
