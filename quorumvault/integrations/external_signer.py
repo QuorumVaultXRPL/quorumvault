@@ -56,6 +56,15 @@ credential type are always caller-supplied; QuorumVault consumes credentials
 and never issues them. Absent verifier is not silently treated as verified: it
 emits an ``AgentIdentityNotWiredWarning``.
 
+REFUSAL ALERTING (optional, purely observational).
+A refusal is recorded in ``last_decision`` and raised as
+``ExternalSignerRefused``, but nothing actively notifies a human unless
+something is wired to do so. An optional injected
+:class:`~quorumvault.integrations.alerts.RefusalAlertSink` fires once on any
+refusal, before the exception propagates. It never changes whether a
+transaction is refused, and a delivery failure surfaces as
+``AlertDeliveryFailedWarning`` rather than as (or suppressing) the refusal.
+
 Amounts are parsed straight into :class:`~decimal.Decimal` from XRPL's own wire
 format (the drops string for XRP, the ``"value"`` decimal string for IOU/MPT) —
 never routed through ``float`` at all. See :mod:`quorumvault.policy.money` for
@@ -73,6 +82,7 @@ from typing import FrozenSet, Iterable, List, Optional
 from xrpl.core.binarycodec import encode
 from xrpl.models.transactions.transaction import Transaction
 
+from .alerts import AlertDeliveryFailedWarning, RefusalAlertSink
 from ..policy.agent_identity import (
     AgentIdentityError,
     AgentIdentityNotWiredWarning,
@@ -139,6 +149,7 @@ class QuorumVaultExternalSigner:
         recognized_credential_issuers: Optional[Iterable[str]] = None,
         required_credential_type: Optional[str] = None,
         identity_subjects: Optional[Iterable[str]] = None,
+        alert_sink: Optional[RefusalAlertSink] = None,
     ):
         self._address = treasury_address
         self._quorum = quorum_signer
@@ -178,6 +189,11 @@ class QuorumVaultExternalSigner:
             if signable_transaction_types is not None
             else DEFAULT_SIGNABLE_TX_TYPES
         )
+        # Refusal alerting: optional, purely observational. A missing sink is
+        # NOT a fail-closed condition (the refusal already happened correctly),
+        # so there is no *NotWired warning for it - only AlertDeliveryFailed if
+        # a wired sink fails to deliver. Never affects the refusal itself.
+        self._alert_sink = alert_sink
         self.last_decision: Optional[SignDecision] = None
 
     # -- ExternalSigner contract ----------------------------------------
@@ -191,7 +207,26 @@ class QuorumVaultExternalSigner:
         Raises :class:`ExternalSignerRefused` on an unsupported transaction type,
         an un-valuable transaction, any non-GREEN Auditor verdict, a live
         treasury-config guard violation, or an unverified agent identity.
+
+        On any refusal, an optional injected ``alert_sink`` is notified once
+        before the exception propagates - purely observational: alert delivery
+        never changes whether the transaction is refused, and a delivery failure
+        surfaces as
+        :class:`~quorumvault.integrations.alerts.AlertDeliveryFailedWarning`,
+        never as (or suppressing) the ``ExternalSignerRefused``.
         """
+        # Reset per-call decision state so a refusal that happens before the
+        # decision is recorded (e.g. an unvaluable tx, raised inside
+        # _intent_from_tx) never carries a stale decision from a previous call
+        # into the refusal alert.
+        self.last_decision = None
+        try:
+            return self._sign(tx)
+        except ExternalSignerRefused as exc:
+            self._alert_refusal(tx, exc)
+            raise
+
+    def _sign(self, tx: Transaction) -> dict:
         tx_type = getattr(tx.transaction_type, "value", str(tx.transaction_type))
 
         # Deliberate type gate, evaluated before (and independent of) the risk
@@ -240,6 +275,36 @@ class QuorumVaultExternalSigner:
     def signers_count(self) -> int:
         """How many signatures this signer contributes (multisig fee sizing)."""
         return len(self._quorum.signer_addresses)
+
+    def _alert_refusal(self, tx: Transaction, exc: ExternalSignerRefused) -> None:
+        """Fire the optional refusal alert. Never affects the refusal itself.
+
+        Best-effort and fully isolated: a missing sink is a no-op (a refusal
+        going unobserved is not a security failure the way a missing treasury /
+        identity check is), and a sink that raises or times out is caught and
+        surfaced as AlertDeliveryFailedWarning rather than propagating as (or
+        suppressing) the ExternalSignerRefused.
+        """
+        if self._alert_sink is None:
+            return
+        try:
+            tx_type = getattr(tx.transaction_type, "value", str(tx.transaction_type))
+        except Exception:
+            tx_type = "unknown"
+        decision = self.last_decision or SignDecision(
+            tier="refused", risk_level="REFUSED", fired_reasons=[str(exc)]
+        )
+        try:
+            self._alert_sink.notify(decision, tx_type=tx_type)
+        except Exception as alert_exc:  # a broken alert channel must never surface as a refusal
+            warnings.warn(
+                AlertDeliveryFailedWarning(
+                    "refusal alert delivery failed "
+                    f"({type(alert_exc).__name__}): {alert_exc}. The refusal "
+                    "itself is unaffected."
+                ),
+                stacklevel=2,
+            )
 
     def _verify_treasury_config(self) -> None:
         """Verify the treasury's live 2-of-2 config, or refuse.
