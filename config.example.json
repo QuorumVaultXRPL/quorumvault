@@ -1,0 +1,11 @@
+{
+  "whitelist": [
+    "rUJG3wx2DsbyCajtKSWKptTVsDLnevP63F",
+    "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
+  ],
+  "amount_threshold_rlusd": 5000,
+  "frequency_window_s": 60.0,
+  "frequency_limit": 3,
+  "channel_ceiling_rlusd": 100,
+  "fast_path_ceiling_rlusd": 5000
+}

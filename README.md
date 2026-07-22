@@ -181,6 +181,26 @@ python testnet_multisig_demo_v2.py --submit
 
 ---
 
+## Configuration
+
+Risk and routing parameters are no longer hardcoded at each call site — a non-technical operator can adjust them in a JSON file, with no code change and no redeploy. Copy `config.example.json`, edit the values, and point QuorumVault at it:
+
+```python
+from quorumvault.config import load_settings, default_settings
+
+settings = load_settings("config.json")   # or default_settings() for the built-in defaults
+risk_engine = settings.build_risk_engine()
+router = settings.build_router()
+```
+
+`python testnet_multisig_demo_v2.py --config config.example.json` shows the same wiring; with no `--config` it falls back to `default_settings()` — the same `100` / `5000` ceilings and `5000` / `60s` / `3` risk defaults as before. This change is purely additive: every existing call site keeps working unchanged.
+
+**Adjustable today** (see `config.example.json`): the destination `whitelist`, the `amount_threshold_rlusd` value gate, the velocity rule's `frequency_window_s` / `frequency_limit`, and the two tier ceilings `channel_ceiling_rlusd` / `fast_path_ceiling_rlusd`. Money fields are parsed with `json.load(parse_float=Decimal)`, so a value like `5000.10` stays an exact `Decimal` and never a binary-float artifact (a plain number is fine; a quoted `"5000.10"` string is accepted too). A bad file fails closed with a specific `ConfigError` — a missing or misspelled field, a wrong type, a non-positive number, or `channel_ceiling_rlusd >= fast_path_ceiling_rlusd` (the same invariant `TierRouter` enforces) — and never partially applies. An empty `whitelist` is valid and *maximally restrictive* (every destination flags RED), not a hole.
+
+**Deliberately not adjustable via this file (yet):** security-critical trust anchors and infrastructure wiring are a different kind of setting than a business risk number, and don't belong in the same casually-edited file. So the treasury guard's expected signers/quorum (live signing authority — arguably deserves the same ceremony as an on-ledger `SignerListSet` change), agent-identity's recognized credential issuers / required credential type (security trust anchors), the refusal-alert webhook URL (infra/credential-adjacent), and KMS/signing-backend selection are all left for separate, deliberate treatment. There is no web UI here either — this is a file, not a dashboard.
+
+---
+
 ## Security tradeoffs (flagged, not hidden)
 
 1. **ed25519 and cloud HSM/KMS.** *(Corrected 2025-11-07.)* AWS KMS **now signs ed25519 natively** — key spec `ECC_NIST_EDWARDS25519`, signing algorithm `ED25519_SHA_512` with `MessageType="RAW"` — [announced Nov 7, 2025](https://aws.amazon.com/about-aws/whats-new/2025/11/aws-kms-edwards-curve-digital-signature-algorithm/) and available in all AWS Regions ([KMS key spec reference](https://docs.aws.amazon.com/kms/latest/developerguide/symm-asymm-choose-key-spec.html)). So today's ed25519 Testnet signers can move to a **non-exportable KMS-backed key with no curve migration and no `SignerListSet` change** — use `AwsKmsEd25519SignerBackend`, the ed25519 sibling of the original secp256k1 `AwsKmsSignerBackend`. That is a materially better production path than the earlier "migrate a signer to secp256k1 first, one at a time" route, which is no longer necessary; the secp256k1 KMS path still works unchanged if ever wanted. **GCP KMS** was not re-verified for this change — check Google Cloud KMS's current signing-algorithm list directly before assuming ed25519 support either way. HashiCorp Vault's `transit` engine remains an ed25519-capable alternative behind the same `SignerBackend` interface.

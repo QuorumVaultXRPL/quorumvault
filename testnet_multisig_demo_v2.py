@@ -29,7 +29,7 @@ from quorumvault.policy.intent import PaymentIntent, RwaTransfer
 from quorumvault.signing.keystore import EncryptedKeystore
 from quorumvault.signing.local_keystore import LocalEncryptedKeystoreBackend
 from quorumvault.signing.quorum_signer import QuorumSigner
-from quorumvault.tiers.router import Tier, TierRouter
+from quorumvault.config import default_settings, load_settings
 
 TESTNET_JSON_RPC = "https://s.altnet.rippletest.net:51234"
 
@@ -55,9 +55,8 @@ def load_backends(keystore_path: str):
     return exec_backend, auditor_backend
 
 
-def demo_routing() -> None:
+def demo_routing(router) -> None:
     line("TIER ROUTING (offline) — the transaction's stakes pick the lane")
-    router = TierRouter(channel_ceiling_rlusd=100, fast_path_ceiling_rlusd=5000)
     samples = [
         PaymentIntent(destination="rPayee...", asset="XRP", amount=5, purpose="API call"),
         PaymentIntent(destination="rVendor...", asset="RLUSD", amount=1500, purpose="invoice"),
@@ -122,14 +121,26 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--keystore", default="keystore.json")
     parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to a risk & routing settings JSON file (see "
+        "config.example.json). If omitted, the built-in default_settings() are "
+        "used - the same values as before.",
+    )
+    parser.add_argument(
         "--submit",
         action="store_true",
         help="Broadcast one multisigned Payment to XRPL Testnet (opt-in, Testnet only).",
     )
     args = parser.parse_args(argv)
 
+    # Risk & routing parameters now come from a settings object: a config file
+    # if one is given, else the built-in defaults (same 100/5000 ceilings as
+    # before). This replaces the previously hardcoded TierRouter(...) call.
+    settings = load_settings(args.config) if args.config else default_settings()
+
     exec_backend, auditor_backend = load_backends(args.keystore)
-    demo_routing()
+    demo_routing(settings.build_router())
     demo_offline_multisign(exec_backend, auditor_backend)
 
     if args.submit:
